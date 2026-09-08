@@ -458,8 +458,193 @@ function SystemSetAudio()
     if ($vol > 100) {
         $vol = 100;
     }
+
+    // Optional "target" addresses one node in the PipeWire graph instead of the
+    // global master.  Omitted (the shape every existing caller sends) keeps the
+    // original master-only behaviour untouched.
+    if (isset($input['target'])) {
+        // "adjust" is a delta against the target's own current level, for
+        // Volume Adjust; "volume" is absolute.
+        if (isset($input['adjust'])) {
+            $current = SystemGetTargetVolume($input['target']);
+            if ($current < 0) {
+                http_response_code(400);
+                return json(array("status" => "ERROR", "message" => "Could not read current volume for target"));
+            }
+            $vol = max(0, min(100, $current + intval($input['adjust'])));
+        }
+        return SystemSetTargetedAudio($input['target'], $vol);
+    }
+
     setVolume($vol);
     return json(array("status" => $rc, "volume" => $vol));
+}
+
+/**
+ * Split a volume target into its "type" plus id parts.
+ *
+ * Accepts the flat "type:id[:id2]" key listed by
+ * GET /api/pipewire/audio/targets, or the object form
+ * { "type": "sink", "id": "fpp_group_kitchen" }.
+ */
+function SystemParseVolumeTarget($target)
+{
+    if (is_array($target)) {
+        $parts = array(isset($target['type']) ? $target['type'] : '');
+        if (isset($target['id'])) {
+            $parts[] = strval($target['id']);
+        }
+        if (isset($target['id2'])) {
+            $parts[] = strval($target['id2']);
+        }
+        return $parts;
+    }
+    return explode(':', strval($target));
+}
+
+/**
+ * Current volume (0-100) for a target, or -1 if it cannot be determined.
+ *
+ * Read from the saved PipeWire config rather than the live graph: every setter
+ * now persists on write, so the config is authoritative and readable even when
+ * the node is not currently running (an idle stream slot, a card that is not
+ * playing).
+ */
+function SystemGetTargetVolume($target)
+{
+    global $settings;
+
+    $parts = SystemParseVolumeTarget($target);
+    $type = $parts[0];
+    $mediaDir = $settings['mediaDirectory'];
+
+    if ($type === 'slot' && count($parts) >= 2) {
+        $slot = intval($parts[1]);
+        // Every slot, slot 1 included, has a fader of its own; the master is a
+        // separate control applied downstream.
+        $file = "$mediaDir/config/pipewire-stream-slots.json";
+        if (file_exists($file)) {
+            $data = json_decode(file_get_contents($file), true);
+            if (isset($data['slots'][strval($slot)])) {
+                return intval($data['slots'][strval($slot)]);
+            }
+        }
+        return 100;
+    }
+
+    if ($type === 'sink' && count($parts) >= 2) {
+        $file = "$mediaDir/config/pipewire-audio-groups.json";
+        if (!file_exists($file)) {
+            return -1;
+        }
+        $data = json_decode(file_get_contents($file), true);
+        if (!is_array($data) || !isset($data['groups'])) {
+            return -1;
+        }
+        foreach ($data['groups'] as $group) {
+            $groupName = isset($group['name']) ? $group['name'] : 'Group';
+            $groupNode = 'fpp_group_' . preg_replace('/[^a-zA-Z0-9_]/', '_', strtolower($groupName));
+            if ($groupNode === $parts[1]) {
+                return isset($group['volume']) ? intval($group['volume']) : 100;
+            }
+            if (!isset($group['members'])) {
+                continue;
+            }
+            $groupId = isset($group['id']) ? intval($group['id']) : 0;
+            foreach ($group['members'] as $member) {
+                $cardId = isset($member['cardId']) ? $member['cardId'] : '';
+                $fxNode = 'fpp_fx_g' . $groupId . '_' . preg_replace('/[^a-zA-Z0-9_]/', '_', strtolower($cardId));
+                $nodeTarget = isset($member['nodeTarget']) ? $member['nodeTarget'] : '';
+                if ($fxNode === $parts[1] || ($nodeTarget !== '' && $nodeTarget === $parts[1])) {
+                    return isset($member['volume']) ? intval($member['volume']) : 100;
+                }
+            }
+        }
+        return -1;
+    }
+
+    if (($type === 'input' || $type === 'route') && count($parts) >= 3) {
+        $file = "$mediaDir/config/pipewire-input-groups.json";
+        if (!file_exists($file)) {
+            return -1;
+        }
+        $data = json_decode(file_get_contents($file), true);
+        if (!is_array($data) || !isset($data['inputGroups'])) {
+            return -1;
+        }
+        foreach ($data['inputGroups'] as $ig) {
+            if (intval($ig['id']) !== intval($parts[1])) {
+                continue;
+            }
+            if ($type === 'input') {
+                $idx = intval($parts[2]);
+                if (isset($ig['members'][$idx])) {
+                    return isset($ig['members'][$idx]['volume']) ? intval($ig['members'][$idx]['volume']) : 100;
+                }
+                return -1;
+            }
+            $pathKey = strval(intval($parts[2]));
+            if (isset($ig['routing'][$pathKey]['volume'])) {
+                return intval($ig['routing'][$pathKey]['volume']);
+            }
+            return 100;
+        }
+        return -1;
+    }
+
+    return -1;
+}
+
+/**
+ * Apply a volume to a single PipeWire node.
+ *
+ * $target is either the flat "type:id[:id2]" key listed by
+ * GET /api/pipewire/audio/targets, or the equivalent object form
+ * { "type": "sink", "id": "fpp_group_kitchen" }.  Resolution and the actual
+ * pactl/pw-cli work stay in pipewire.php -- this only routes to the right
+ * setter there.
+ */
+function SystemSetTargetedAudio($target, $vol)
+{
+    $parts = SystemParseVolumeTarget($target);
+    $type = $parts[0];
+
+    switch ($type) {
+        case 'sink':
+            if (count($parts) < 2) {
+                break;
+            }
+            return SetPipeWireGroupVolume(array("sink" => $parts[1], "volume" => $vol));
+        case 'slot':
+            if (count($parts) < 2) {
+                break;
+            }
+            return SetStreamSlotVolume(array("slot" => intval($parts[1]), "volume" => $vol));
+        case 'input':
+            if (count($parts) < 3) {
+                break;
+            }
+            return SetInputGroupMemberVolume(array(
+                "groupId" => intval($parts[1]),
+                "memberIndex" => intval($parts[2]),
+                "volume" => $vol
+            ));
+        case 'route':
+            if (count($parts) < 3) {
+                break;
+            }
+            return SetRoutingPathVolume(array(
+                "inputGroupId" => intval($parts[1]),
+                "outputGroupId" => intval($parts[2]),
+                "volume" => $vol
+            ));
+    }
+
+    http_response_code(400);
+    return json(array(
+        "status" => "ERROR",
+        "message" => "Unrecognized volume target; see GET /api/pipewire/audio/targets"
+    ));
 }
 
 /**
@@ -476,6 +661,21 @@ function SystemSetAudio()
 function SystemGetAudio()
 {
     global $settings;
+
+    // Optional ?target= reports one PipeWire node's level instead of the
+    // master.  Absent (what every existing caller sends) is unchanged.
+    if (isset($_GET['target']) && $_GET['target'] !== '') {
+        $vol = SystemGetTargetVolume($_GET['target']);
+        if ($vol < 0) {
+            http_response_code(404);
+            return json(array(
+                "status" => "ERROR",
+                "message" => "Unknown volume target; see GET /api/pipewire/audio/targets"
+            ));
+        }
+        return json(array("status" => "OK", "method" => "Target",
+            "target" => $_GET['target'], "volume" => $vol));
+    }
 
     $curl = curl_init('http://localhost:32322/fppd/status');
     curl_setopt($curl, CURLOPT_FAILONERROR, true);
@@ -602,19 +802,14 @@ function SystemGetStatus()
                     $data = '{"T":"Q","M":"ST","B":0,"E":0,"I":0,"P":{}}';
                     curl_setopt($curl, CURLOPT_POSTFIELDS, $data);
                     curl_setopt($curl, CURLOPT_HTTPHEADER, array('Content-Type:application/json'));
-                } else if ($type == "ESPixelStick") {
-                    $curl = curl_init("http://$urlHost/ws"); // WebSocket URL (use wss:// for secure connections)
-                    curl_setopt($curl, CURLOPT_URL, "http://$urlHost/ws");
-                    curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
-                    curl_setopt($curl, CURLOPT_HTTPHEADER, [
-                        "Connection: Upgrade",
-                        "Upgrade: websocket",
-                        "Host: $urlHost",
-                        "Origin: http://$urlHost",
-                        "Sec-WebSocket-Key: " . base64_encode(random_bytes(16)),
-                        "Sec-WebSocket-Version: 13"
-                    ]);
                 } else {
+                    // Everything else, ESPixelStick 4.x included, answers FPP's
+                    // own status URL.  (There used to be an "ESPixelStick" branch
+                    // here that curled http://<ip>/ws with WebSocket upgrade
+                    // headers; curl cannot complete a WS handshake, let alone
+                    // frame a request, so it only ever returned "unreachable".
+                    // ESPixelStick 3.x really is WebSocket-only and is polled
+                    // from the browser through /proxy/<ip>/ws instead.)
                     $curl = curl_init("http://" . $urlHost . "/api/system/status");
                 }
                 curl_setopt($curl, CURLOPT_FAILONERROR, true);
@@ -752,6 +947,94 @@ function SystemGetInfo()
     return json($result);
 }
 
+function GetFPPDRestartBlocked()
+{
+    // Check if systemd is available
+    $hasSystemctl = trim(shell_exec("which systemctl 2>/dev/null")) !== "";
+    if (!$hasSystemctl) {
+        return array("blocked" => false);
+    }
+    // Quick check: is fppd in failed state?
+    $activeState = trim(shell_exec("systemctl show fppd --property=ActiveState --value 2>/dev/null"));
+    $result = trim(shell_exec("systemctl show fppd --property=Result --value 2>/dev/null"));
+    if ($activeState !== "failed") {
+        return array("blocked" => false);
+    }
+    // Check if the failure is due to restart limit (Start request repeated too quickly)
+    $statusOutput = shell_exec("systemctl status fppd 2>&1 | head -n 30");
+    if (strpos($statusOutput, "Start request repeated too quickly") === false) {
+        // Also check journal for the message in case status doesn't show it
+        $statusOutput2 = shell_exec("journalctl -u fppd --no-pager -n 20 2>&1 | grep -q 'Start request repeated too quickly' && echo found || echo notfound");
+        if (trim($statusOutput2) !== "found") {
+            return array("blocked" => false);
+        }
+    }
+    // Get interval and timestamps
+    $intervalStr = trim(shell_exec("systemctl show fppd --property=StartLimitIntervalSec --value 2>/dev/null"));
+    // StartLimitIntervalSec may be in microseconds (e.g. 200000000 for 200s) or seconds (200)
+    $intervalSec = 200; // default from fppd.service
+    if ($intervalStr !== "" && is_numeric($intervalStr)) {
+        $intervalVal = intval($intervalStr);
+        if ($intervalVal > 10000) {
+            $intervalSec = intval($intervalVal / 1000000);
+        } else if ($intervalVal > 0) {
+            $intervalSec = $intervalVal;
+        }
+    }
+    // Also try manager property if unit doesn't have it
+    if ($intervalSec === 200) {
+        $managerInterval = trim(shell_exec("systemctl show --property=StartLimitIntervalSec --value 2>/dev/null"));
+        if ($managerInterval !== "" && is_numeric($managerInterval)) {
+            $mVal = intval($managerInterval);
+            if ($mVal > 10000) $mVal = intval($mVal / 1000000);
+            if ($mVal > 0) $intervalSec = $mVal;
+        }
+    }
+    $inactiveTimestamp = trim(shell_exec("systemctl show fppd --property=InactiveEnterTimestamp --value 2>/dev/null"));
+    $remainingSec = $intervalSec;
+    if ($inactiveTimestamp !== "" && $inactiveTimestamp !== "n/a") {
+        $inactiveTime = strtotime($inactiveTimestamp);
+        if ($inactiveTime !== false) {
+            $elapsed = time() - $inactiveTime;
+            $remainingSec = max(0, $intervalSec - $elapsed);
+        }
+    } else {
+        // Fallback: try monotonic timestamp
+        $inactiveMonotonic = trim(shell_exec("systemctl show fppd --property=InactiveEnterTimestampMonotonic --value 2>/dev/null"));
+        if ($inactiveMonotonic !== "" && $inactiveMonotonic !== "0") {
+            // Monotonic is microseconds since boot; compare to current monotonic
+            $nowMonotonic = trim(shell_exec("cat /proc/uptime 2>/dev/null | awk '{print int(\$1*1000000)}'"));
+            if (is_numeric($inactiveMonotonic) && is_numeric($nowMonotonic)) {
+                $elapsedSec = intval((intval($nowMonotonic) - intval($inactiveMonotonic)) / 1000000);
+                $remainingSec = max(0, $intervalSec - $elapsedSec);
+            }
+        }
+    }
+    return array(
+        "blocked" => $remainingSec > 0,
+        "remainingSec" => intval($remainingSec),
+        "intervalSec" => intval($intervalSec),
+        "burst" => 5
+    );
+}
+
+/**
+ * Get FPPD restart blocked status
+ *
+ * Returns whether FPPD is currently blocked from restarting due to systemd's
+ * StartLimitBurst (too many restarts in a short time) and how long to wait.
+ *
+ * @route GET /api/system/fppd/restartStatus
+ * @response 200 Restart blocked status
+ * ```json
+ * {"blocked": true, "remainingSec": 87, "intervalSec": 200, "burst": 5}
+ * ```
+ */
+function GetFPPDRestartStatus()
+{
+    return json(GetFPPDRestartBlocked());
+}
+
 /**
  * Adds network interfaces, reboot/restart flags, boot delay status, advanced system info,
  * plugin header indicators, and crash warnings to the `fppd` status array.
@@ -835,6 +1118,9 @@ function finalizeStatusJson($obj)
         }
     }
 
+    // Check if FPPD restart limit has been hit (Start request repeated too quickly)
+    $obj['fppdRestartBlocked'] = GetFPPDRestartBlocked();
+
     return $obj;
 }
 
@@ -849,25 +1135,69 @@ function finalizeStatusJson($obj)
  * ["apache2", "ffmpeg", "php"]
  * ```
  */
-function GetOSPackages()
+function ReadPackageNamesFrom($cmd)
 {
     $packages = [];
-    $cmd = 'apt list --all-versions 2>&1'; // Fetch all package names and versions
-    $handle = popen($cmd, 'r'); // Open a process for reading the output
-
-    if ($handle) {
-        while (($line = fgets($handle)) !== false) {
-            // Extract the package name before the slash
-            if (preg_match('/^([^\s\/]+)\//', $line, $matches)) {
-                $packages[] = $matches[1];
-            }
+    $handle = popen($cmd, 'r');
+    if ($handle === false) {
+        return $packages;
+    }
+    while (($line = fgets($handle)) !== false) {
+        $line = rtrim($line, "\r\n");
+        if ($line !== '') {
+            $packages[] = $line;
         }
-        pclose($handle); // Close the process
-    } else {
-        error_log("Error: Unable to fetch package list.");
+    }
+    pclose($handle);
+
+    return $packages;
+}
+
+/**
+ * Every package name apt knows about, sorted and deduplicated.
+ *
+ * The obvious implementation -- parsing `apt list` -- is what this replaces,
+ * and it was slow enough to be the whole cost of the Packages page: `apt list`
+ * builds and formats a record per package (version, archive, architecture,
+ * install state) and then this threw all of that away and kept the name. On a
+ * PocketBeagle2 that was 5.5s warm and far worse on the first load of the day,
+ * when the 56MB index has to come off eMMC. `--all-versions` made it worse
+ * again for nothing: it repeats a package once per available version, so the
+ * list arrived with tens of thousands of duplicates in it (34,750 of 104,875
+ * entries on one box here) that the page then had to hold and search.
+ *
+ * Reading the index files directly is the same data from the same source --
+ * these are the files apt itself parses -- for the one field that is wanted.
+ * The dpkg status file is included alongside them so a package that is
+ * installed but no longer in any configured repository still appears, which is
+ * what `apt list` does too. Measured against it on a PocketBeagle2: 0.52s
+ * versus 5.5s, and the two produce identical name sets.
+ *
+ * Falls back to asking apt if that yields implausibly little -- an apt
+ * configured to keep its indexes compressed (Acquire::GzipIndexes) would leave
+ * no *_Packages for the glob to match.
+ */
+function CollectOSPackageNames()
+{
+    $packages = ReadPackageNamesFrom(
+        'grep -h "^Package: " /var/lib/apt/lists/*_Packages /var/lib/dpkg/status 2>/dev/null'
+        . ' | sed "s/^Package: //" | LC_ALL=C sort -u'
+    );
+
+    if (count($packages) > 100) {
+        return $packages;
     }
 
-    return json_encode($packages);
+    error_log("GetOSPackages: no usable apt index files, falling back to apt list");
+
+    return ReadPackageNamesFrom(
+        'apt list 2>/dev/null | sed -n "s|^\([^ /]*\)/.*|\1|p" | LC_ALL=C sort -u'
+    );
+}
+
+function GetOSPackages()
+{
+    return json(CollectOSPackageNames());
 }
 
 /**

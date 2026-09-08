@@ -8,13 +8,13 @@
     require_once "common.php";
     include 'common/menuHead.inc';
     ?>
-    <script type="text/javascript" src="bootstrap-table/js/bootstrap-table.min.js"></script>
-    <script type="text/javascript" src="bootstrap-table/extensions/bootstrap-table-filter-control.min.js"></script>
-    <link rel="stylesheet" href="bootstrap-table/css/bootstrap-table.min.css" />
-    <link rel="stylesheet" href="bootstrap-table/extensions/bootstrap-table-filter-control.min.css" />
+    <script type="text/javascript" src="bootstrap-table/js/bootstrap-table.min.js?ref=<?= filemtime('bootstrap-table/js/bootstrap-table.min.js'); ?>"></script>
+    <script type="text/javascript" src="bootstrap-table/extensions/bootstrap-table-filter-control.min.js?ref=<?= filemtime('bootstrap-table/extensions/bootstrap-table-filter-control.min.js'); ?>"></script>
+    <link rel="stylesheet" href="bootstrap-table/css/bootstrap-table.min.css?ref=<?= filemtime('bootstrap-table/css/bootstrap-table.min.css'); ?>" />
+    <link rel="stylesheet" href="bootstrap-table/extensions/bootstrap-table-filter-control.min.css?ref=<?= filemtime('bootstrap-table/extensions/bootstrap-table-filter-control.min.css'); ?>" />
 
-    <script type="text/javascript" src="js/xlsx.full.min.js" async></script>
-    <script type="text/javascript" src="js/FileSaver.min.js" async></script>
+    <script type="text/javascript" src="js/xlsx.full.min.js?ref=<?= filemtime('js/xlsx.full.min.js'); ?>" async></script>
+    <script type="text/javascript" src="js/FileSaver.min.js?ref=<?= filemtime('js/FileSaver.min.js'); ?>" async></script>
 
     <title><? echo $pageTitle; ?></title>
     <!-- TODO: extract to www/css/multisync.css when ready to split into external files -->
@@ -407,6 +407,17 @@
             return buildHttpURL(ip, path);
         }
 
+        /**
+         * WebSocket counterpart to wrapUrlWithProxy(): a same-origin ws:// (or
+         * wss:// on an https page) URL that Apache's /proxy/<ip>/ upgrade rule
+         * tunnels to the device.  Keeping the socket on our own origin is what
+         * keeps it inside the page's CSP connect-src and clear of CORS.
+         */
+        function wsProxyUrl(ip, path) {
+            var scheme = (window.location.protocol === 'https:') ? 'wss://' : 'ws://';
+            return scheme + window.location.host + '/proxy/' + ip + path;
+        }
+
         function ipLink(ip) {
             if (fppConfig.hideExternalURLs) {
                 return ip;
@@ -660,6 +671,76 @@
             }
 
             return false;
+        }
+
+        /**
+         * Collects this machine's own addresses out of the multiSync system list.
+         * Only routable IPv4 is useful for the comparison below; loopback and
+         * link-local say nothing about which subnets we can reach.
+         */
+        function localIPv4Addresses(data) {
+            var ips = [];
+            for (var i = 0; i < data.length; i++) {
+                if (data[i].local != 1)
+                    continue;
+                var ip = data[i].address || '';
+                if (ip.indexOf('.') < 0 || ip.indexOf('127.') == 0 || ip.indexOf('169.254') == 0)
+                    continue;
+                ips.push(ip);
+            }
+            return ips;
+        }
+
+        /**
+         * How well an address matches one of ours: 3 = same /24 as a local
+         * address, 2 = same /16, 1 = same /8, 0 = no match (or not IPv4).
+         * A device that advertises an AP or second-NIC address alongside its LAN
+         * address must be polled on the one this browser can actually route to,
+         * so the higher-scoring address wins the row's poll slot.
+         */
+        function ipLocalityScore(ip, localIps) {
+            if (!ip || ip.indexOf('.') < 0)
+                return 0;
+            for (var o = 3; o > 0; o--) {
+                for (var i = 0; i < localIps.length; i++) {
+                    if (IPsCanTalk(localIps[i], ip, o))
+                        return o;
+                }
+            }
+            return 0;
+        }
+
+        /**
+         * Points a row's poll slot at a different address of the same device:
+         * swaps oldIp for newIp in whichever poll list already holds it.
+         */
+        function swapPollAddress(pollLists, oldIp, newIp) {
+            for (var l = 0; l < pollLists.length; l++) {
+                var idx = pollLists[l].indexOf(oldIp);
+                if (idx >= 0) {
+                    pollLists[l][idx] = newIp;
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        /**
+         * The hostname cell: the device name over its host description, with the
+         * name linked to that device's own web UI (unless the link would point
+         * back at ourselves or external links are disabled).  Built from the
+         * row's preferred address and rebuilt when a better one turns up, so the
+         * link stays clickable — the WLED poller also locates the name span by
+         * that address.
+         */
+        function buildHostnameCell(ctx) {
+            var hostTxt = (!isWLED(ctx.typeId) && (fppConfig.hideExternalURLs || ctx.local || ctx.ip == ctx.hostname))
+                ? ctx.hostname
+                : "<a target='host_" + ctx.ip + "' href='" + wrapUrlWithProxy(ctx.ip, "/") + "'>" + ctx.hostname + "</a>";
+
+            return "<span class='reorder-grip'><i class='rowGripIcon fpp-icon-grip'></i></span>" +
+                   "<span id='fpp_" + ctx.ip.replace(/\./g, '_') + "_hostname'" + ctx.spanStyle + ">" + hostTxt + "</span>" +
+                   "<br><small class='hostDescriptionSM'>" + msEscape(ctx.description) + "</small>";
         }
 
         function getReachableIPFromRowID(id) {
@@ -1168,6 +1249,52 @@
             return rc;
         }
 
+        function msEscape(s) {
+            return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+        }
+
+        /**
+         * fppd now collects the slow-changing detail about every FPP remote
+         * itself (see MultiSync::CheckSystemInfoRefreshes) and returns it on
+         * each multiSyncSystems entry as `systemInfo`.  Fold the two channel
+         * I/O flags up to the top level so the rest of the page sees a remote
+         * exactly the way it already sees the local system -- which also means
+         * checkRemoteChannelIO() returns without issuing its per-remote
+         * universeOutputs/universeInputs fetches.
+         */
+        function foldSystemInfo(entry) {
+            var si = entry.systemInfo;
+            if (!si) return;
+            if (!entry.hasOwnProperty('channelInputsEnabled') &&
+                si.hasOwnProperty('channelInputsEnabled')) {
+                entry.channelInputsEnabled = si.channelInputsEnabled;
+            }
+            if (!entry.hasOwnProperty('channelOutputsEnabled') &&
+                si.hasOwnProperty('channelOutputsEnabled')) {
+                entry.channelOutputsEnabled = si.channelOutputsEnabled;
+            }
+        }
+
+        /**
+         * Third line of the platform cell: the cape fppd found on the remote,
+         * with designer/vendor/serial in the tooltip.  Returns '' when the
+         * remote has no cape or hasn't been asked yet.
+         */
+        function getCapeHtml(cape) {
+            if (!cape || !cape.present) return '';
+            var name = cape.name || cape.id || '';
+            if (name === '') return '';
+            var bits = [];
+            if (cape.version) bits.push('Version: ' + cape.version);
+            if (cape.designer) bits.push('Designer: ' + cape.designer);
+            if (cape.vendor && cape.vendor.name) bits.push('Vendor: ' + cape.vendor.name);
+            if (cape.description) bits.push(cape.description);
+            var attr = bits.length ? " title='" + msEscape(bits.join('\n')) + "'" : '';
+            return "<br><small class='text-muted'" + attr + ">" +
+                "<i class='fas fa-microchip'></i> " + msEscape(name) + "</small>";
+        }
+
         function getChannelIOIcons(data, ip) {
             var icons = '';
             var hasInput = data.hasOwnProperty('channelInputsEnabled') && data.channelInputsEnabled;
@@ -1275,7 +1402,20 @@
                             status = '<span class="text-danger">Protected</span>';
                         } else if (data.status_name == 'unknown') {
                             status = '-';
-                        } else if (data.status_name == 'idle') {
+                        } else if ((data.status_name == 'idle') ||
+                                   (data.status_name == 'playing media') ||
+                                   (data.status_name == 'playing background')) {
+                            // 'playing media'/'playing background' mean a stream
+                            // slot is active outside a playlist.  The player is
+                            // still idle, so a remote in this state may equally
+                            // be syncing -- keep running the sync check below
+                            // rather than falling through to the raw string,
+                            // which would drop the "Syncing: <files>" detail.
+                            if (data.status_name == 'playing media') {
+                                status = 'Playing Media';
+                            } else if (data.status_name == 'playing background') {
+                                status = 'Background Audio';
+                            }
                             if (data.mode_name == 'remote') {
                                 if ((data.sequence_filename != "") ||
                                     (data.media_filename != "")) {
@@ -1405,6 +1545,7 @@
                             }
                             item.platform = "<span id='" + rowID + "_platform'>" + platformTxt + "</span>" +
                                 "<br><small id='" + rowID + "_variant'>" + variantTxt + "</small>" +
+                                (item._capeHtml || '') +
                                 "<span class='hidden typeId'> " + item._typeIdHex + " </span>" +
                                 "<span class='hidden version'>" + item._versionStr + "</span>";
 
@@ -1433,7 +1574,10 @@
                                 item.gitversions = u;
                             }
 
-                            if (data.advancedView.OSVersion !== "") {
+                            // Absent, not just empty: a device that isn't running
+                            // FPP OS (an ESPixelStick, say) sends no OSVersion at
+                            // all, and `undefined !== ""` rendered "OS: undefined".
+                            if (data.advancedView.OSVersion) {
                                 item.version = "<table class='multiSyncVerboseTable'>" +
                                     "<tr><td><small class='text-muted'>FPP:</small></td><td>" + item._versionStr + "</td></tr>" +
                                     "<tr><td><small class='text-muted'>OS:</small></td><td>" + data.advancedView.OSVersion + "</td></tr>" +
@@ -1637,10 +1781,15 @@
                 }
             }
 
+            // Our own addresses, used to score each remote address so a device
+            // advertising several gets polled on the one we can reach.
+            var localIps = localIPv4Addresses(data);
+
             var fppIpAddresses = [];
             var wledIpAddresses = [];
             var geniusIpAddresses = [];
             var baldrickIpAddresses = [];
+            var espIpAddresses = [];
             var falconV4Addresses = [];
             var falconV3Addresses = [];
 
@@ -1762,13 +1911,29 @@
 
                 if (seenUuids.hasOwnProperty(uuid)) {
                     // Same physical device, additional IP — merge into existing row.
-                    // Do NOT add to poll list; the primary IP already covers this device.
+                    // Do NOT add a second poll entry; one address covers the device.
                     var mergeExtra = '<br>' + ipLink(data[i].address);
                     if (data[i].fppModeString == 'remote') mergeExtra += star;
                     var mergeItem = seenUuids[uuid]._item;
                     mergeItem.ipaddress    += mergeExtra;
                     mergeItem._baseIpHtml  += mergeExtra;
                     mergeItem._dataIplist  += ',' + data[i].address;
+
+                    // The address the row landed on first is whichever one the
+                    // device happened to announce first, which may be an AP or
+                    // second-NIC address on a subnet we have no route into —
+                    // polling it would report the whole device as Unreachable.
+                    // If this address sits closer to one of ours, move the row's
+                    // poll slot (and its action buttons, via _dataIp) onto it.
+                    if (ipLocalityScore(ip, localIps) > ipLocalityScore(mergeItem._dataIp, localIps)) {
+                        swapPollAddress([fppIpAddresses, wledIpAddresses, geniusIpAddresses,
+                                         baldrickIpAddresses, espIpAddresses,
+                                         falconV4Addresses, falconV3Addresses],
+                                        mergeItem._dataIp, ip);
+                        mergeItem._dataIp = ip;
+                        mergeItem._hostCtx.ip = ip;
+                        mergeItem.hostname = buildHostnameCell(mergeItem._hostCtx);
+                    }
                     continue;
                 }
 
@@ -1793,9 +1958,10 @@
                 if ((data[i].fppModeString == 'remote') && (star != ""))
                     ipTxt = "<small class='unicastPickerLabel'>Select IPs for Unicast Sync</small><br>" + ipTxt + star;
 
-                var hostTxt = (!isWLED(data[i].typeId) && (fppConfig.hideExternalURLs || data[i].local || data[i].address == hostname))
-                    ? hostname
-                    : "<a target='host_" + data[i].address + "' href='" + wrapUrlWithProxy(data[i].address, "/") + "'>" + hostname + "</a>";
+                // Detail fppd already fetched from this remote over HTTP.  Every
+                // field below used to arrive only with the api/system/status poll,
+                // which is what made the table reflow after the first render.
+                var si = data[i].systemInfo || {};
 
                 var versionParts = data[i].version.split('.');
                 var majorVersion = 0;
@@ -1819,7 +1985,7 @@
                     }
                     versionHtml = "<table class='multiSyncVerboseTable'>" +
                         "<tr><td>FPP:</td><td>" + versionStr + "</td></tr>" +
-                        "<tr><td>OS:</td><td></td></tr>" +
+                        "<tr><td>OS:</td><td>" + msEscape(si.OSVersion || '') + "</td></tr>" +
                         "</table>";
                 } else {
                     versionHtml = data[i].version;
@@ -1830,35 +1996,77 @@
                     selectboxHtml = "<input type='checkbox' class='remoteCheckbox largeCheckbox multisyncRowCheckbox' name='" + data[i].address + "'>";
                 }
 
-                var ipDash = ip.replace(/\./g, '_');
                 var typeIdHex = '0x' + parseInt(data[i].typeId).toString(16);
+
+                // Prefer the remote's own SubPlatform/Variant over the model
+                // string carried in the ping packet, matching what the status
+                // poll would have replaced it with a moment later.
+                var platformInit = si.Platform || data[i].type;
+                var variantInit = si.SubPlatform || si.Variant || data[i].model;
+                var capeHtml = getCapeHtml(data[i].capeInfo);
+
+                var rowColor = '';
+                if (si.backgroundColor) {
+                    var colorInt = parseInt(si.backgroundColor, 16);
+                    if (!isNaN(colorInt)) {
+                        rowColor = colorInt;
+                    }
+                }
+
+                var gitHtml = '';
+                if (si.LocalGitVersion) {
+                    gitHtml = "<table class='multiSyncVerboseTable'>" +
+                        "<tr><td><small class='text-muted'>COMMIT:</small></td><td id='" + rowID + "_localgitvers'>" +
+                        getLocalVersionLink(data[i].address, { advancedView: si }) + "</td></tr>" +
+                        "<tr><td><small class='text-muted'>BRANCH:</small></td><td id='" + rowID + "_gitbranch'>" +
+                        msEscape(si.Branch || '') + "</td></tr>";
+                    if (si.UpgradeSource && si.UpgradeSource != 'github.com') {
+                        gitHtml += "<tr><td><small class='text-muted'>ORIGIN:</small></td><td id='" + rowID +
+                            "_origin'>" + msEscape(si.UpgradeSource) + "</td></tr>";
+                    } else {
+                        gitHtml += "<span class='d-none' id='" + rowID + "_origin'></span>";
+                    }
+                    gitHtml += "</table>";
+                }
+
+                // Everything the hostname cell is built from, kept on the row so
+                // the cell can be rebuilt if the row's preferred address moves.
+                var hostCtx = {
+                    ip:          data[i].address,
+                    hostname:    hostname,
+                    typeId:      data[i].typeId,
+                    local:       data[i].local,
+                    spanStyle:   hnSpanStyle,
+                    description: si.HostDescription || ''
+                };
 
                 var newItem = {
                     _id:           rowID,
                     _dataIp:       data[i].address,
+                    _hostCtx:      hostCtx,
                     _dataIplist:   data[i].address,
                     _hostname:     hostname,
                     _isFPP:        isFPP(data[i].typeId),
                     _typeIdHex:    typeIdHex,
-                    _platformInit: data[i].type,
-                    _variantInit:  data[i].model,
+                    _platformInit: platformInit,
+                    _variantInit:  variantInit,
+                    _capeHtml:     capeHtml,
                     _versionStr:   versionStr,
                     _baseIpHtml:   ipTxt,
-                    hostname:     "<span class='reorder-grip'><i class='rowGripIcon fpp-icon-grip'></i></span>" +
-                                  "<span id='fpp_" + ipDash + "_hostname'" + hnSpanStyle + ">" + hostTxt + "</span>" +
-                                  "<br><small class='hostDescriptionSM'></small>",
+                    hostname:     buildHostnameCell(hostCtx),
                     ipaddress:    ipTxt,
-                    platform:     "<span id='" + rowID + "_platform'>" + data[i].type + "</span>" +
-                                  "<br><small id='" + rowID + "_variant'>" + data[i].model + "</small>" +
+                    platform:     "<span id='" + rowID + "_platform'>" + msEscape(platformInit) + "</span>" +
+                                  "<br><small id='" + rowID + "_variant'>" + msEscape(variantInit) + "</small>" +
+                                  capeHtml +
                                   "<span class='hidden typeId'> " + typeIdHex + " </span>" +
                                   "<span class='hidden version'>" + data[i].version + "</span>",
                     mode:         fppMode,
                     status:       'Last Seen:<br>' + data[i].lastSeenStr,
                     elapsed:      '',
                     version:      versionHtml,
-                    gitversions:  '',
+                    gitversions:  gitHtml,
                     utilization:  '',
-                    fppcolor:     '',
+                    fppcolor:     rowColor,
                     selectbox:    selectboxHtml
                 };
                 systemsData.push(newItem);
@@ -1889,10 +2097,21 @@
                 if (isFPP(data[i].typeId)) {
                     fppIpAddresses.push(ip);
                 } else if (isESPixelStick(data[i].typeId)) {
-                    if ((majorVersion == 4) || (majorVersion == 0)) {
-                        getESPixelStickBridgeStatus(ip);
-                    } else {
+                    // Which firmware generation decides how we ask:
+                    //   3.x serves the two-letter command protocol (XJ/G1/G2) on a
+                    //        WebSocket at /ws, and nothing else.
+                    //   4.x dropped that socket entirely and answers FPP's own
+                    //        /api/system/status, so it needs no special case at all.
+                    // These were the wrong way round, which is why no ESPixelStick
+                    // of either generation ever reported status.  An unparsed
+                    // version means a device too new to know about: assume 4.x.
+                    if ((majorVersion >= 4) || (majorVersion == 0)) {
                         fppIpAddresses.push(ip);
+                    } else {
+                        // Probed after the table is built, the way every other
+                        // device type here already does; probing inline let one
+                        // device abort the whole render.
+                        espIpAddresses.push(ip);
                     }
                 } else if (isFalconV4(data[i].typeId)) {
                     falconV4Addresses.push(ip);
@@ -1910,6 +2129,9 @@
             getWLEDControllerStatus(wledIpAddresses, false);
             getGeniusControllerStatus(geniusIpAddresses, false);
             getBaldrickControllerStatus(baldrickIpAddresses, false);
+            for (var ei = 0; ei < espIpAddresses.length; ei++) {
+                getESPixelStickBridgeStatus(espIpAddresses[ei]);
+            }
             getFalconControllerStatus(falconV3Addresses, falconV4Addresses, false);
 
             var extraRemotes = [];
@@ -2068,8 +2290,23 @@
             $('.masterOptions').hide();
             $('#fppSystems').html("<tr><td colspan=8 align='center'>Loading system list from fppd.</td></tr>");
 
-            const r = await fetch('api/fppd/multiSyncSystems');
-            const data = await r.json();
+            var data;
+            try {
+                const r = await fetch('api/fppd/multiSyncSystems');
+                if (!r.ok) {
+                    throw new Error("HTTP " + r.status);
+                }
+                data = await r.json();
+            } catch (err) {
+                console.log("Could not load the system list: " + err);
+                $('#fppSystems').html("<tr><td colspan=8 align='center'>Could not load the system list from fppd. <a href='javascript:getFPPSystems();'>Retry</a></td></tr>");
+                return;
+            }
+            if (!data || !Array.isArray(data.systems)) {
+                $('#fppSystems').html("<tr><td colspan=8 align='center'>fppd returned no system list. <a href='javascript:getFPPSystems();'>Retry</a></td></tr>");
+                return;
+            }
+            data.systems.forEach(foldSystemInfo);
             systemsList = data.systems;
             parseFPPSystems(data.systems);
         }
@@ -2164,7 +2401,14 @@
             safeInitBody($tbl);
 
             if ($('#MultiSyncRefreshStatus').is(":checked")) {
-                setTimeout(function () { ESPSockets[ips].send("XJ"); }, 1000);
+                setTimeout(function () {
+                    // onclose deletes the entry, and send() throws on a socket
+                    // that is closing or already gone.
+                    var sock = ESPSockets[ips];
+                    if (sock && sock.readyState === WebSocket.OPEN) {
+                        sock.send("XJ");
+                    }
+                }, 1000);
             }
         }
 
@@ -2191,13 +2435,30 @@
             safeInitBody($tbl);
         }
 
+        /**
+         * Poll an ESPixelStick v4 for status.
+         *
+         * The socket goes through the player's own /proxy/<ip>/ws route, never
+         * straight at the device: same-origin keeps it inside the page's CSP
+         * connect-src and out of CORS, exactly like every other device on this
+         * page reaches its controller through our PHP.  Connecting direct also
+         * broke more than the stick -- new WebSocket() throws a SecurityError
+         * when CSP blocks the URL, and Firefox surfaced that as a thrown
+         * NS_ERROR_CONTENT_BLOCKED that unwound parseFPPSystems() and left the
+         * whole system table empty.
+         */
         function getESPixelStickBridgeStatus(ip) {
             var ips = ip.replace(/\./g, '_');
 
             if (ESPSockets.hasOwnProperty(ips)) {
-                ESPSockets[ips].send("XJ");
+                // send() throws InvalidStateError while the socket is still
+                // CONNECTING; the onopen handler below already sends the first XJ.
+                var open = ESPSockets[ips];
+                if (open.readyState === WebSocket.OPEN) {
+                    open.send("XJ");
+                }
             } else {
-                var ws = new WebSocket("ws://" + ip + "/ws");
+                var ws = new WebSocket(wsProxyUrl(ip, "/ws"));
                 ESPSockets[ips] = ws;
 
                 ws.binaryType = "arraybuffer";
@@ -2236,7 +2497,6 @@
                 };
             }
         }
-
 
         // ============================================================
         // SECTION: Falcon polling
@@ -2449,7 +2709,10 @@
                 var $tbl = $('#fppSystemsTable');
                 Object.entries(alldata).forEach(function (entry) {
                     var ip = entry[0], data = entry[1];
-                    if (data == null || data == "" || data == "null") {
+                    // A controller can answer without a "system" block; reading
+                    // through it unguarded threw and abandoned every device left
+                    // in this response, including the safeInitBody() below.
+                    if (data == null || data == "" || data == "null" || data.system == null) {
                         return;
                     }
                     var uf = formatUptime(data.system.uptime_seconds);
@@ -2463,7 +2726,7 @@
                     if (!item) return;
                     item.utilization = u;
                     item.status = data.status_name;
-                    var friendlyName = (data.system && data.system.friendly_name) ? data.system.friendly_name : "";
+                    var friendlyName = data.system.friendly_name ? data.system.friendly_name : "";
                     if (friendlyName != "" && item.hostname.indexOf("class='hostDescriptionSM'></small>") >= 0) {
                         item.hostname = item.hostname.replace(
                             "class='hostDescriptionSM'></small>",
@@ -2583,10 +2846,10 @@
                     ips.push(ip);
                 } else if (isESPixelStick(typeId)) {
                     var majorVersion = parseInt((item._versionStr || '0').split('.')[0]);
-                    if (majorVersion >= 4) {
-                        getESPixelStickBridgeStatus(ip);
-                    } else {
+                    if ((majorVersion >= 4) || (majorVersion == 0)) {
                         ips.push(ip);
+                    } else {
+                        getESPixelStickBridgeStatus(ip);
                     }
                 } else if (isFalconV4(typeId)) {
                     fv4ips.push(ip);
@@ -3736,8 +3999,8 @@
                             <table id='fppSystemsTable' class="bootstrap-popup" cellpadding='3'>
                                 <thead>
                                     <tr>
-                                        <th data-field="hostname" data-sortable="true" data-filter-control="input">
-                                            Hostname</th>
+                                        <th data-field="hostname" data-sortable="true" data-filter-control="input"
+                                            data-sorter="hostnameSorter">Hostname</th>
                                         <th data-field="ipaddress" data-sortable="true" data-filter-control="input"
                                             data-sorter="ipSorter">IP Address</th>
                                         <th data-field="platform" data-sortable="true" data-filter-control="select"
@@ -3963,6 +4226,11 @@
                 }
             });
 
+            // The proxy list only decorates the links, so it must never gate the
+            // system list.  Chaining getFPPSystems() inside this .then() meant a
+            // single failed/slow api/proxies request left the table stuck on
+            // "Loading system list from fppd." forever, even though
+            // api/fppd/multiSyncSystems was answering fine.
             fetch("api/proxies")
                 .then(function (r) { return r.json(); })
                 .then(function (data) {
@@ -3974,7 +4242,12 @@
                         let ip = $(this).attr('data-ip');
                         $(this).attr('href', wrapUrlWithProxy(ip, "/"));
                     });
-
+                })
+                .catch(function (err) {
+                    console.log("Could not load proxy list: " + err);
+                    proxies = [];
+                })
+                .finally(function () {
                     getFPPSystems();
                     getLocalFpposFiles();
                 });
@@ -3996,6 +4269,18 @@
             $("#MultiSyncBroadcast").on("change", validateMultiSyncSettings);
             $("#MultiSyncMulticast").on("change", validateMultiSyncSettings);
             $("#MultiSyncUnicast").on("change", validateMultiSyncSettings);
+
+            // Custom hostname sorter for Bootstrap Table.
+            // The hostname cell is HTML (grip icon, link, host description) and the
+            // markup ahead of the name is identical on every row, so a plain string
+            // sort of the cell ends up comparing the IP baked into the span id
+            // rather than the hostname.  Sort on the raw name stashed on the row.
+            window.hostnameSorter = function (a, b, rowA, rowB) {
+                var nameA = (rowA && rowA._hostname) ? rowA._hostname : String(a).replace(/<[^>]*>/g, ' ');
+                var nameB = (rowB && rowB._hostname) ? rowB._hostname : String(b).replace(/<[^>]*>/g, ' ');
+                // numeric so pi2 sorts ahead of pi10, base so case is ignored
+                return nameA.trim().localeCompare(nameB.trim(), undefined, { numeric: true, sensitivity: 'base' });
+            };
 
             // Custom IP sorter for Bootstrap Table - numeric IP comparison
             window.ipSorter = function (a, b) {

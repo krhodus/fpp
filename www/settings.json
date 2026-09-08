@@ -799,7 +799,7 @@
 			"type": "modal",
 			"modalUrl": "pipewire-routing-matrix.php?modal=1",
 			"icon": "fas fa-th",
-			"buttonText": "Open Routing Matrix",
+			"buttonText": "Configure Routing Matrix",
 			"modalTitle": "PipeWire Routing Matrix",
 			"platforms": [
 				"!MacOS"
@@ -831,10 +831,11 @@
 			"name": "PipeWireVideoInputSources",
 			"description": "Video Input Sources",
 			"tip": "Configure persistent video input sources (test patterns, cameras) that appear in the PipeWire graph. Video Output Groups can target these sources to display them on HDMI outputs, pixel overlays, or network streams.",
-			"type": "link",
-			"linkUrl": "pipewire-video-inputs.php",
+			"type": "modal",
+			"modalUrl": "pipewire-video-inputs.php?modal=1",
 			"icon": "fas fa-video",
 			"buttonText": "Configure Video Input Sources",
+			"modalTitle": "PipeWire Video Input Sources",
 			"platforms": [
 				"!MacOS"
 			]
@@ -855,7 +856,7 @@
 		"PipeWireOpusRTPConfig": {
 			"name": "PipeWireOpusRTPConfig",
 			"description": "Opus RTP Audio Streaming",
-			"tip": "Send and receive compressed audio streams over WiFi or wired networks using the Opus codec. Ideal for wireless audio where AES67 would be unreliable.",
+			"tip": "Send and receive compressed audio streams over WiFi or wired networks using the Opus codec. Ideal for wireless audio and instances where AES67 is not a valid cost option.",
 			"type": "modal",
 			"modalUrl": "opus-rtp-config.php?modal=1",
 			"icon": "fas fa-wifi",
@@ -928,6 +929,7 @@
 		},
 		"AES67MulticastIP": {
 			"name": "AES67MulticastIP",
+			"pii": true,
 			"description": "Multicast IP Address",
 			"tip": "The multicast group IP address for AES67 RTP streams. The AES67 standard uses the 239.69.x.x range. Default is 239.69.0.1.",
 			"gatherStats": true,
@@ -981,6 +983,7 @@
 		},
 		"AES67SessionName": {
 			"name": "AES67SessionName",
+			"pii": true,
 			"description": "Session Name",
 			"tip": "A descriptive name for this AES67 stream that will be visible to other AES67 devices on the network via SAP announcements.",
 			"gatherStats": true,
@@ -1399,6 +1402,7 @@
 		},
 		"emailfromtext": {
 			"name": "emailfromtext",
+			"pii": true,
 			"description": "From Name",
 			"tip": "Text to use in From field of emails.",
 			"type": "text",
@@ -1407,6 +1411,7 @@
 		},
 		"emailfromuser": {
 			"name": "emailfromuser",
+			"pii": true,
 			"description": "From Email Address",
 			"tip": "Email address to be used to send emails.",
 			"type": "text",
@@ -1437,6 +1442,7 @@
 		},
 		"emailserver": {
 			"name": "emailserver",
+			"pii": true,
 			"description": "SMTP Server Hostname",
 			"tip": "Server used to send outbound email.",
 			"type": "text",
@@ -1455,6 +1461,7 @@
 		},
 		"emailtoemail": {
 			"name": "emailtoemail",
+			"pii": true,
 			"description": "Default TO Address",
 			"tip": "Default destination email address to send all emails.",
 			"type": "text",
@@ -1463,6 +1470,7 @@
 		},
 		"emailuser": {
 			"name": "emailuser",
+			"pii": true,
 			"description": "SMTP Server Login",
 			"tip": "Login for SMTP server, may be the same as the from address.",
 			"type": "text",
@@ -1534,6 +1542,7 @@
 		},
 		"FPP_UUID": {
 			"name": "FPP_UUID",
+			"pii": true,
 			"description": "Override UUID",
 			"gatherStats": true,
 			"tip": "FPP UUID to use for FPP Connect de-duplication, stats, and services.  This will override using the serial number from /proc/cpuinfo or dmidecode.",
@@ -1695,6 +1704,7 @@
 		},
 		"gitHubUser": {
 			"name": "gitHubUser",
+			"pii": true,
 			"description": "GitHub User Name",
 			"tip": "GitHub user name used together with the GitHub Personal Access Token below to install/upgrade plugins hosted in private GitHub repositories. Only used when 'Use Credentials' is selected on the Plugin Manager page.",
 			"level": 3,
@@ -1714,7 +1724,7 @@
 		"DistributedCompile": {
 			"name": "DistributedCompile",
 			"description": "Distributed Compile",
-			"tip": "Distribute FPP source compiles to a helper host to speed up full rebuilds (e.g. after a branch switch or a header change that invalidates ccache). Set up the helper with scripts/setup_distcc_host.sh (distcc) or scripts/setup_nocc_host.sh (nocc), running the same compiler major version. Any distributed mode disables the precompiled header. 'nocc' does NOT preprocess locally, so it is far faster on slow single-core boards (BeagleBone Black, Pi Zero); 'distcc' preprocesses locally then compiles on the helper; 'distcc + zeroconf' auto-discovers distcc helpers on the LAN via mDNS, and 'nocc + mdns' does the same for nocc helpers (set one up with 'sudo scripts/setup_nocc_host.sh', which makes it advertise itself).",
+			"tip": "Distribute FPP source compiles to a helper host to speed up full rebuilds (e.g. after a branch switch or a header change that invalidates ccache). RECOMMENDED: run 'sudo scripts/setup_nocc_host.sh' on a fast machine and pick 'nocc + mdns' here -- the helper advertises itself on the LAN, so Compile Hosts can stay empty. 'nocc' is the same thing with the helper named by hand in Compile Hosts (use it when mDNS does not reach this board). nocc does NOT preprocess locally, so it is far faster on slow single-core boards (BeagleBone Black, Pi Zero). The distcc modes ('distcc', 'distcc + zeroconf', helper set up with scripts/setup_distcc_host.sh) preprocess locally and are the fallback when a helper cannot run nocc-server. Client and helper must run the same compiler major version, and any distributed mode disables the precompiled header.",
 			"level": 3,
 			"restart": 0,
 			"reboot": 0,
@@ -1739,7 +1749,7 @@
 		"DistccHosts": {
 			"name": "DistccHosts",
 			"description": "Compile Hosts",
-			"tip": "Space separated list of helper hosts. distcc: host[:port][/jobs][,options], e.g. 'fpppi5:3632/6,lzo'. nocc: host[:port] (default port 43210), e.g. 'fpppi5'. Not used for 'distcc + zeroconf' or 'nocc + mdns' (helpers are discovered via mDNS).",
+			"tip": "Space separated list of helper hosts. distcc: host[:port][/jobs][,options], e.g. 'myhelper:3632/6,lzo'. nocc: host[:port] (default port 43210), e.g. 'myhelper'. Not used for 'distcc + zeroconf' or 'nocc + mdns' (helpers are discovered via mDNS).",
 			"level": 3,
 			"restart": 0,
 			"reboot": 0,
@@ -1784,6 +1794,7 @@
 		},
 		"Latitude": {
 			"name": "Latitude",
+			"pii": true,
 			"description": "Latitude",
 			"tip": "Latitude of geographic location of FPP system.  The latitude/longitude can be used by the FPP scheduler to calculate the sunrise/sunset times.  The default values provided are for Falcon, Colorado.",
 			"restart": 2,
@@ -1817,6 +1828,8 @@
 				"128x64 Flipped I2C (SH1106)": 6,
 				"128x128 I2C (SSD1327)": 9,
 				"128x128 Flipped I2C (SSD1327)": 10,
+				"128x128 I2C (SH1107)": 34,
+				"128x128 Flipped I2C (SH1107)": 35,
 				"Adafruit 16x2 LCD (I2C 0x20)": 11,
 				"PCF8574A 16x2 LCD (I2C 0x3F)": 12,
 				"PCF8574A 20x4 LCD (I2C 0x3F)": 13,
@@ -2079,6 +2092,7 @@
 		},
 		"Longitude": {
 			"name": "Longitude",
+			"pii": true,
 			"description": "Longitude",
 			"tip": "Longitude of geographic location of FPP system.  The latitude/longitude can be used by the FPP scheduler to calculate the sunrise/sunset times.  The default values provided are for Falcon, Colorado.",
 			"restart": 2,
@@ -2265,6 +2279,7 @@
 		},
 		"MQTTUsername": {
 			"name": "MQTTUsername",
+			"pii": true,
 			"description": "Username",
 			"tip": "Username to use to authenticate with the MQTT broker",
 			"restart": 2,
@@ -2294,6 +2309,7 @@
 		},
 		"MultiSyncExternalIPAddress": {
 			"name": "MultiSyncExternalIPAddress",
+			"pii": true,
 			"description": "External IP Address For Multisync Packets",
 			"tip": "The External IP address that other hosts see for this FPP instance.  Leave blank for default.",
 			"gatherStats": true,
@@ -2381,6 +2397,7 @@
 		},
 		"MultiSyncExtraRemotes": {
 			"name": "MultiSyncExtraRemotes",
+			"pii": true,
 			"description": "MultiSync Unicast Discovery IPs (CSV list)",
 			"tip": "FPP will send unicast MultiSync discovery messages to the IPs in this list to allow discovery of devices which are unable to be discovered via FPP's normal multicast discovery.  This may include systems on remote networks or connected to certain routers which do not pass multicast packets between wired and wireless interfaces.",
 			"level": 1,
@@ -2687,6 +2704,7 @@
 		},
 		"KioskUrl": {
 			"name": "KioskUrl",
+			"pii": true,
 			"description": "Kiosk Start URL",
 			"gatherStats": true,
 			"tip": "By default kiosk mode will open the main FPP page, you can place a URL in here to get it to open that URL directly, eg big buttons plugin. http://localhost/plugin.php?_menu=status&plugin=fpp-BigButtons&page=bigbuttons.php&nopage=1",
@@ -2781,7 +2799,7 @@
 			"name": "ShareCrashData",
 			"description": "Share Crash Data with FPP Developers",
 			"gatherStats": true,
-			"tip": "Create a crash report if fppd crashes, and optionally send it to the FPP developers.  'Keep locally' still writes a full report to the crashes folder so you can look at it or submit it yourself, but sends nothing; 'Disabled' does not write one at all.  The sending options control how much is included: just the stack traces, or additional settings and configuration files that help reproduce the problem.",
+			"tip": "Create a crash report if fppd crashes, and send it to the FPP developers.  'Keep locally' still writes a full report to the crashes folder so you can look at it or submit it yourself, but sends nothing; 'Disabled' does not write one at all.  'Send stack traces only' sends the crash stack, the fault registers, the playlist position, the list of installed plugins and - if you gave one - the contact email address below, so we can ask you about it; it does not send this device's name, network addresses or settings.  The other options add settings and configuration files that help reproduce the problem; passwords, Wi-Fi passphrases, e-mail addresses and location are removed, and the network interface configuration is never included.",
 			"type": "select",
 			"options": {
 				"Disabled - do not create a report": "-1",
@@ -2837,6 +2855,8 @@
 		},
 		"emailAddress": {
 			"name": "emailAddress",
+			"pii": true,
+			"piiPurpose": "crash-report",
 			"description": "Email Address",
 			"tip": "Email address to contact you.  In the case of FPP crashes, the developers may need to contact you to help diagnose the cause of the crash.  This email address would only be used for that purpose.",
 			"level": 0,

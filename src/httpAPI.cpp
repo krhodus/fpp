@@ -51,6 +51,7 @@ extern volatile int runMainFPPDLoop;
 
 #include "MultiSync.h"
 #include "OutputMonitor.h"
+#include "mediaoutput/VideoInputManager.h"
 #include "RecurringTasks.h"
 #include "Player.h"
 #include "Plugins.h"
@@ -77,6 +78,7 @@ extern volatile int runMainFPPDLoop;
 #include "commands/Condition.h"
 #include "mediaoutput/AES67Manager.h"
 #include "mediaoutput/AudioSourceRegistry.h"
+#include "mediaoutput/AudioLevelMonitor.h"
 #include "mediaoutput/MediaOutputBase.h"
 #include "mediaoutput/MediaOutputStatus.h"
 #include "mediaoutput/OpusRTPManager.h"
@@ -122,6 +124,12 @@ void GetCurrentFPPDStatus(Json::Value& result) {
 
     if (ChannelTester::INSTANCE.Testing()) {
         result["status_name"] = "testing";
+        // Which test is running (same shape as GET api/testmode, minus any
+        // per-output "config" blob).  Pushed over the status WebSocket, so
+        // every open page can track a test started or stopped elsewhere.
+        Json::Value tm = ChannelTester::INSTANCE.GetStatusJson();
+        if (!tm.isNull())
+            result["testMode"] = tm;
     } else {
         switch (result["status"].asInt()) {
         case FPP_STATUS_IDLE:
@@ -267,7 +275,64 @@ void GetCurrentFPPDStatus(Json::Value& result) {
         result["scheduler"] = scheduler->GetInfo();
 
         // Add multi-stream slot status
-        result["streamSlots"] = StreamSlotManager::Instance().GetAllSlotsStatus();
+        Json::Value slots = StreamSlotManager::Instance().GetAllSlotsStatus();
+        result["streamSlots"] = slots;
+
+        // Media started outside a playlist -- "Play Media", a PSA, background
+        // music -- runs on a stream slot rather than through the player, so
+        // status_name read "idle" while audio was audibly playing.  The slot
+        // data was already here; nothing looked at it.  That cost real
+        // debugging time more than once: a box was declared silent on the
+        // strength of this field while a track was running.
+        //
+        // Only the display fields move.  result["status"] deliberately stays
+        // FPP_STATUS_IDLE, because the scheduler gates on it in eight places
+        // and both Player::StopNow() and Scheduler wait on
+        // `while (GetStatus() != FPP_STATUS_IDLE)`.  Those loops stop the
+        // playlist, not a slot, so reporting a slot as player activity would
+        // spin them forever.
+        bool anyForeground = false, anyBackground = false;
+        int lead = -1;
+        for (Json::ArrayIndex i = 0; i < slots.size(); i++) {
+            if (slots[i]["status"].asString() != "playing") {
+                continue;
+            }
+            // StreamSlot::isBackground exists but nothing currently sets it,
+            // so it cannot be the only test or this never fires.  The manager
+            // already treats slots 2-5 as background everywhere else --
+            // StopBackgroundSlots() and ProcessBackgroundSlots() both operate
+            // on exactly that range -- so follow the same rule here, and keep
+            // honouring the flag for when it does get populated.
+            const bool bg = slots[i]["isBackground"].asBool() ||
+                            slots[i]["slot"].asInt() > 1;
+            anyForeground |= !bg;
+            anyBackground |= bg;
+            // Prefer a foreground slot as the one to describe; fall back to a
+            // background slot so a PSA or background music still names itself.
+            if (lead < 0 || (!bg && slots[lead]["isBackground"].asBool())) {
+                lead = (int)i;
+            }
+        }
+
+        result["media_playing"] = anyForeground || anyBackground;
+        if (lead >= 0) {
+            result["status_name"] = anyForeground ? "playing media" : "playing background";
+            const std::string f = slots[lead]["mediaFilename"].asString();
+            result["current_song"] = f.substr(f.find_last_of("/\\") + 1);
+            // Only publish a position when the slot actually tracks one.
+            // Nothing drives slot 1's Process() when media is started outside
+            // a playlist -- both StreamSlotManager loops begin at slot 2,
+            // because slot 1 is normally the playlist's own media and the
+            // playlist pumps it -- so setMediaElapsed() never runs and these
+            // stay 0 for the whole track.  Reporting that as a real position
+            // is worse than omitting it.
+            const int elapsed = slots[lead]["secondsElapsed"].asInt();
+            const int remaining = slots[lead]["secondsRemaining"].asInt();
+            if (elapsed > 0 || remaining > 0) {
+                result["seconds_played"] = std::to_string(elapsed);
+                result["seconds_remaining"] = std::to_string(remaining);
+            }
+        }
     }
 }
 
@@ -402,6 +467,48 @@ void APIServer::Init(void) {
     };
     app.registerHandler("/opusrtp", copyHandler(handleOpusRTP), {drogon::Get, drogon::Head});
     app.registerHandlerViaRegex("/opusrtp/.*", copyHandler(handleOpusRTP), {drogon::Get, drogon::Head});
+#endif
+
+#ifdef HAS_AUDIO_LEVEL_MONITOR
+    // Subscribe to live signal levels for a set of PipeWire nodes. Internal to
+    // fppd -- the browser reaches it through the PHP passthrough at
+    // /api/pipewire/audio/meters, and reads the levels themselves off the
+    // /fppdws WebSocket rather than polling for them.
+    //
+    // Body: {"nodes":[{"name":"fpp_group_x","sink":true}, ...], "ttl": 6000}
+    // "sink" says how to capture the node -- see AudioLevelMonitor::StartMeter.
+    //
+    // Metering is kept alive by time rather than by a connection: a caller
+    // re-posts to hold it open, so a browser that goes away silently stops
+    // costing anything once the TTL lapses. An empty list stops it at once.
+    auto handleMeters = [](const HttpRequestPtr& req,
+                           std::function<void(const HttpResponsePtr&)>&& callback) {
+        Json::Value body;
+        std::vector<AudioLevelMonitor::Target> nodes;
+        int ttl = 6000;
+        if (LoadJsonFromString(std::string(req->getBody()), body)) {
+            if (body.isMember("nodes") && body["nodes"].isArray()) {
+                for (const auto& n : body["nodes"]) {
+                    AudioLevelMonitor::Target t;
+                    // Objects carry the node's kind; a bare string is assumed
+                    // to be a sink, which is what most metered nodes are.
+                    if (n.isObject()) {
+                        t.name = n.get("name", "").asString();
+                        t.isSink = n.get("sink", true).asBool();
+                    } else {
+                        t.name = n.asString();
+                    }
+                    nodes.push_back(t);
+                }
+            }
+            if (body.isMember("ttl")) {
+                ttl = body["ttl"].asInt();
+            }
+        }
+        AudioLevelMonitor::INSTANCE.Subscribe(nodes, ttl);
+        callback(makeStringResponse("{\"status\":\"OK\"}", 200, "application/json"));
+    };
+    app.registerHandler("/fppd/meters", copyHandler(handleMeters), {drogon::Post});
 #endif
 
     // Plugin-published PipeWire audio sources (AudioSourceRegistry). Internal
@@ -676,6 +783,50 @@ void APIServer::Init(void) {
     // document POST/PUT here without checking Player.cpp again.
     app.registerHandler("/player", copyHandler(handlePlayer), {drogon::Get, drogon::Post, drogon::Put, drogon::Head});
     app.registerHandlerViaRegex("/player/.*", copyHandler(handlePlayer), {drogon::Get, drogon::Post, drogon::Put, drogon::Head});
+
+    // Video input preview (/videoinput/preview?id=N)
+    //
+    // Returns a single JPEG frame tapped off a running video input source's
+    // intervideo channel, so the config page can show the operator what the
+    // capture device is actually producing.  Tapping the channel (rather than
+    // opening /dev/videoN again) means the preview works while the source is
+    // live -- UVC cameras only allow a single opener.
+    auto handleVideoInputPreview = [](const HttpRequestPtr& req,
+                                      std::function<void(const HttpResponsePtr&)>&& callback) {
+        int id = 0;
+        auto idStr = req->getParameter("id");
+        if (!idStr.empty()) {
+            id = std::atoi(idStr.c_str());
+        }
+        int width = 320;
+        auto wStr = req->getParameter("width");
+        if (!wStr.empty()) {
+            width = std::atoi(wStr.c_str());
+        }
+
+        std::vector<uint8_t> jpeg;
+        if (id <= 0 || !VideoInputManager::Instance().GrabSnapshotJPEG(id, width, 2000, jpeg)) {
+            auto resp = makeStringResponse("No frame available", 503);
+            resp->addHeader("Cache-Control", "no-store");
+            callback(resp);
+            return;
+        }
+
+        auto resp = drogon::HttpResponse::newHttpResponse();
+        resp->setStatusCode(drogon::k200OK);
+        resp->setContentTypeCode(drogon::CT_IMAGE_JPG);
+        resp->setBody(std::string(reinterpret_cast<const char*>(jpeg.data()), jpeg.size()));
+        resp->addHeader("Cache-Control", "no-store");
+        callback(resp);
+    };
+    /**
+     * Get a JPEG snapshot of a running video input source, for UI preview.
+     *
+     * @route GET /api/videoinput/preview
+     * @response 200 JPEG image of the most recent frame.
+     * @response 503 Source is not running or produced no frame.
+     */
+    app.registerHandler("/videoinput/preview", copyHandler(handleVideoInputPreview), {drogon::Get, drogon::Head});
 
     // Let plugins register their own routes
     PluginManager::INSTANCE.registerApis();

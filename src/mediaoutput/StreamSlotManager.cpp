@@ -19,6 +19,39 @@
 #include "StreamSlotManager.h"
 #include "GStreamerOut.h"
 #include "mediaoutput.h"
+#include "common.h"
+#include "settings.h"
+
+// The volume the user last set for a slot, from pipewire-stream-slots.json.
+// Slot volumes apply to a stream that only exists while that slot is playing,
+// so they cannot be restored at boot the way group volumes are -- they have to
+// be reapplied each time the slot starts instead.
+//
+// All five slots are treated alike.  Slot 1 used to be excluded because its
+// fader was wired to the global master rather than to the stream, which made it
+// a duplicate master control instead of a slot of its own.
+//
+// KEEP IN SYNC with SaveStreamSlotVolume()/GetStreamSlotVolumes() in
+// www/api/controllers/pipewire.php.
+static int savedStreamSlotVolume(int slot) {
+    if (slot < 1 || slot > 5) {
+        return -1;
+    }
+    Json::Value root;
+    if (!LoadJsonFromFile(FPP_DIR_CONFIG("/pipewire-stream-slots.json"), root) ||
+        !root.isMember("slots")) {
+        return -1;
+    }
+    std::string key = std::to_string(slot);
+    if (!root["slots"].isMember(key)) {
+        return -1;
+    }
+    int v = root["slots"][key].asInt();
+    if (v < 0 || v > 100) {
+        return -1;
+    }
+    return v;
+}
 
 StreamSlotManager::StreamSlotManager() {
     for (int i = 0; i < MAX_SLOTS; i++) {
@@ -57,6 +90,11 @@ void StreamSlotManager::SetActiveOutput(int slot, GStreamerOutput* output) {
         m_slots[slot - 1].mediaFilename = output->m_mediaFilename;
         LogInfo(VB_MEDIAOUT, "StreamSlotManager: slot %d active (%s)\n", slot,
                 output->m_mediaFilename.c_str());
+        int saved = savedStreamSlotVolume(slot);
+        if (saved >= 0) {
+            output->SetVolume(saved);
+            LogDebug(VB_MEDIAOUT, "StreamSlotManager: restored slot %d volume to %d%%\n", slot, saved);
+        }
     }
 #endif
 }
@@ -67,9 +105,15 @@ GStreamerOutput* StreamSlotManager::GetActiveOutput(int slot) {
     return m_slots[slot - 1].activeOutput;
 }
 
-void StreamSlotManager::ClearSlot(int slot) {
+void StreamSlotManager::ClearSlot(int slot, GStreamerOutput* owner) {
     if (slot < 1 || slot > MAX_SLOTS) return;
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    if (owner && m_slots[slot - 1].activeOutput != owner) {
+        // Another (newer) stream has already claimed this slot -- our
+        // teardown is stale, don't blank out its registration.
+        LogDebug(VB_MEDIAOUT, "StreamSlotManager: slot %d clear skipped, already reclaimed by a newer stream\n", slot);
+        return;
+    }
     m_slots[slot - 1].activeOutput = nullptr;
     m_slots[slot - 1].mediaFilename.clear();
     m_slots[slot - 1].isBackground = false;

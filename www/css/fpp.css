@@ -419,29 +419,40 @@ body.has-touch .pageContent-tabs > .nav-item:not(.hidden) {
 	padding-top: 0.5em;
 }
 
-.settingsGroupTable .row > :last-child:after {
-	content: '';
-	width: 0;
-	height: 0;
-	opacity: 0;
+/* Spinner shown on a settings row while that setting's save is in flight.
+   SetSetting() in js/fpp.js adds .settingSaving before the request goes out and
+   removes it when the reply lands.  The API applies the setting before it
+   replies - restarting a service, rewriting the hostname, hashing a password -
+   so this is regularly a multi-second wait.
+
+   No fade and no transition-delay: the point is to tell the user *immediately*
+   that their change was picked up.  A delayed fade-in never made it onto the
+   screen anyway, because the save used to be a synchronous XHR that blocked the
+   main thread for the whole request. */
+@keyframes fppSettingSaveSpin {
+	to {
+		transform: rotate(360deg);
+	}
 }
 
-.settingsGroupTable .row.loading > :last-child:after {
+.row.settingSaving > :last-child::after {
 	content: '';
 	display: inline-block;
 	color: var(--bs-danger);
 	width: 22px;
 	height: 22px;
-	opacity: 1;
 	vertical-align: middle;
 	margin-left: 0.5em;
 	border: 0.25em solid currentColor;
 	border-right-color: transparent;
 	border-radius: 50%;
-	-webkit-animation: spinner-border 0.75s linear infinite;
-	animation: spinner-border 0.75s linear infinite;
-	transition: 0.3s opacity ease-out;
-	transition-delay: 0.5s;
+	animation: fppSettingSaveSpin 0.75s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+	.row.settingSaving > :last-child::after {
+		animation-duration: 1.5s;
+	}
 }
 
 [data-bs-theme='light'] .pageContent .multiSelect {
@@ -4670,6 +4681,27 @@ pre.testData,
 	text-align: center;
 }
 
+/* Generic utility: marks a placeholder that reads as an example or prompt
+   rather than a value, so an empty field is obviously empty at a glance.
+   Needed because this build sets .form-control::placeholder to
+   --bs-secondary-color (75% of the body colour) with opacity forced to 1,
+   which is close enough to real text that a prompt like
+   "https://www.youtube.com/watch?v=..." looks like an entered URL.
+
+   Colour alone does not carry this. Dropping to --bs-tertiary-color (the 50%
+   step) is a contrast cue, and at form-control-sm sizes it still reads as
+   text someone typed. The italic is what actually distinguishes it: a shape
+   difference survives small type, either theme, and low contrast sensitivity,
+   none of which a lighter grey reliably does. Both tokens are defined for
+   light and dark, so this stays readable in both.
+
+   Same rationale as .placeholder-center above for why this is a class at all:
+   ::placeholder is not reachable from a Bootstrap utility. */
+.placeholder-muted::placeholder {
+	color: var(--bs-tertiary-color);
+	font-style: italic;
+}
+
 /* ============================ */
 /* = Upload Drop Zone (FilePond) = */
 /* ============================ */
@@ -4722,4 +4754,297 @@ pre.testData,
 
 .fileponduploader .filepond--drop-label label {
 	min-height: 100px;
+}
+
+/* PipeWire mixer channel rows.
+   Selectors are deliberately `.pw-mixer-strip input[type='range'].pw-mixer-slider`:
+   the global `input[type='range']` rules earlier in this file (and the
+   dark-theme overrides in fpp-dark.css) are more specific than a lone class and
+   size the thumb at 35px for the big master slider, which silently overrode
+   everything here. Colours come from Bootstrap theme variables so both themes
+   work. Horizontal throughout -- a rotated (writing-mode) fader renders
+   inconsistently across browsers and is awkward to drag on touch.
+
+   Tracks and meter grounds are --bs-tertiary-color, NOT --bs-border-color: the
+   strip sits on --bs-tertiary-bg, against which the border colour is 1.7:1 in
+   dark mode and is also exactly the colour of the strip's own border, so the
+   line vanished into the frame. The tertiary *foreground* token composites to
+   a mid grey over the strip in both themes (~#868c92 dark, ~#8d9094 light), so
+   one declaration covers both rather than a theme-specific override. */
+
+/* How many strips share a row. Single column until the dialog is genuinely
+   wide: .modal-xl is only 800px at lg, and two 400px columns leave a fader
+   narrower than the readout beside it. */
+.pw-mixer-strips {
+	display: grid;
+	grid-template-columns: 1fr;
+	gap: 0.5rem;
+}
+
+@media (min-width: 1200px) {
+	.pw-mixer-strips {
+		grid-template-columns: 1fr 1fr;
+	}
+}
+
+/* An output group and the card strips it feeds are one block, so the block --
+   not each strip -- is what the section grid lays out: a group owns a full row
+   and its cards share the columns inside it. Without this a group fader and a
+   card trim could sit side by side as apparent peers, which is what made a
+   one-card group read as two independent outputs. */
+.pw-mixer-strips > .pw-mixer-group {
+	grid-column: 1 / -1;
+	display: grid;
+	gap: 0.5rem;
+}
+
+/* A group holding one card would otherwise leave that card marooned in the
+   left column of a two-column row, reading as half a pair rather than as the
+   group's only output. */
+.pw-mixer-group > .pw-mixer-strips > .pw-mixer-strip:only-child {
+	grid-column: 1 / -1;
+}
+
+/* The strip itself is a grid of named areas rather than a flex row, so the same
+   markup re-flows. A portrait phone cannot fit name + fader + readout + meter +
+   two 44px touch targets on one line (they need ~440px inside a ~320px strip),
+   which is what pushed the fader down to its minimum and overflowed the row.
+   Stacked, the fader gets the full width and the buttons stay beside it:
+
+       [LED] Name             100%   [mute][cue]
+       [========== fader ==========]
+       [========== meter ==========]
+
+   From lg up -- where the dialog is 800px or wider -- the areas collapse back
+   to the one-line channel strip. */
+.pw-mixer-strip {
+	display: grid;
+	align-items: center;
+	column-gap: 0.5rem;
+	row-gap: 0.25rem;
+	grid-template-columns: minmax(0, 1fr) auto auto;
+	grid-template-areas:
+		'label value actions'
+		'slider slider actions'
+		'meter meter actions';
+	background-color: var(--bs-tertiary-bg);
+}
+
+.pw-mixer-strip .pw-mixer-strip-label {
+	grid-area: label;
+	min-width: 0;
+}
+
+/* Names can be long (fpp_fx_g1_headphones); this is the box text-truncate
+   measures itself against, so it has to be allowed to shrink. */
+.pw-mixer-strip .pw-mixer-strip-names {
+	min-width: 0;
+}
+
+/* The name stays on one line and truncates; the sublabel under it wraps to two
+   and only then clamps. It carries the sentence that says what the strip is,
+   and a label column this narrow ended every one of them in an ellipsis --
+   "Output · bcm2835 Head…", "Direct · level is s…" -- which is exactly the
+   half that mattered. Two lines fit them all without taking width from the
+   fader. */
+.pw-mixer-strip .pw-mixer-sublabel {
+	display: -webkit-box;
+	-webkit-box-orient: vertical;
+	-webkit-line-clamp: 2;
+	line-clamp: 2;
+	overflow: hidden;
+	overflow-wrap: anywhere;
+}
+
+.pw-mixer-strip .pw-mixer-meter {
+	grid-area: meter;
+	width: auto;
+}
+
+.pw-mixer-strip .pw-mixer-actions {
+	grid-area: actions;
+}
+
+@media (min-width: 992px) {
+	.pw-mixer-strip {
+		grid-template-columns: 11rem minmax(4rem, 1fr) auto auto auto;
+		grid-template-areas: 'label slider value meter actions';
+	}
+
+	.pw-mixer-strip .pw-mixer-meter {
+		width: 4rem;
+	}
+}
+
+/* Fixed-width readout so the row does not jitter as the number changes. The
+   effective level sits under the number rather than beside it, so the cell
+   stays the same width whether or not it is shown. */
+.pw-mixer-strip .pw-mixer-value {
+	grid-area: value;
+	display: flex;
+	flex-direction: column;
+	align-items: flex-end;
+	line-height: 1.2;
+	min-width: 3.25rem;
+	text-align: end;
+	font-variant-numeric: tabular-nums;
+}
+
+.pw-mixer-strip .pw-mixer-eff {
+	font-size: 0.75em;
+}
+
+/* Comfortable touch targets, matching the round volume buttons rather than
+   shrinking controls to fit more channels onto a phone screen. */
+.pw-mixer-strip .btn {
+	min-width: 44px;
+	min-height: 38px;
+}
+
+.pw-mixer-strip input[type='range'].pw-mixer-slider {
+	grid-area: slider;
+	-webkit-appearance: none;
+	appearance: none;
+	background: transparent;
+	width: 100%;
+	min-width: 0;
+	height: 1.5rem;
+	padding: 0;
+	margin: 0;
+}
+
+.pw-mixer-strip input[type='range'].pw-mixer-slider::-webkit-slider-runnable-track {
+	width: 100%;
+	height: 6px;
+	border-radius: 3px;
+	background: var(--bs-tertiary-color);
+}
+
+.pw-mixer-strip input[type='range'].pw-mixer-slider::-moz-range-track {
+	width: 100%;
+	height: 6px;
+	border-radius: 3px;
+	background: var(--bs-tertiary-color);
+}
+
+.pw-mixer-strip input[type='range'].pw-mixer-slider::-webkit-slider-thumb {
+	-webkit-appearance: none;
+	appearance: none;
+	width: 18px;
+	height: 18px;
+	margin-top: -6px;
+	border-radius: 50%;
+	border: 2px solid var(--bs-body-bg);
+	background-color: var(--bs-primary);
+	box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+}
+
+.pw-mixer-strip input[type='range'].pw-mixer-slider::-moz-range-thumb {
+	-webkit-appearance: none;
+	appearance: none;
+	width: 18px;
+	height: 18px;
+	border-radius: 50%;
+	border: 2px solid var(--bs-body-bg);
+	background-color: var(--bs-primary);
+	box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+}
+
+.pw-mixer-strip input[type='range'].pw-mixer-slider:focus-visible {
+	outline: 2px solid var(--bs-primary);
+	outline-offset: 2px;
+}
+
+/* A read-only strip reports a level that has no stage of its own to move (a
+   source wired straight into a mix bus, say). Bootstrap's own :disabled range
+   styling never showed here: the thumb rules above set the colour
+   unconditionally and outrank it, so a strip nobody could drag looked exactly
+   as draggable as the rest. The dashed frame carries at a glance, the grey
+   thumb on approach, the cursor on the attempt.
+
+   border-style needs the flag to beat Bootstrap's .border shorthand, which
+   sets all three border properties as !important; 5.3 has no border-style
+   utility to use instead. */
+.pw-mixer-strip-readonly {
+	border-style: dashed !important;
+}
+
+.pw-mixer-strip input[type='range'].pw-mixer-slider:disabled {
+	cursor: not-allowed;
+}
+
+.pw-mixer-strip input[type='range'].pw-mixer-slider:disabled::-webkit-slider-thumb {
+	background-color: var(--bs-secondary-color);
+	box-shadow: none;
+}
+
+.pw-mixer-strip input[type='range'].pw-mixer-slider:disabled::-moz-range-thumb {
+	background-color: var(--bs-secondary-color);
+	box-shadow: none;
+}
+
+/* Touch: a thumb sized for a mouse is hard to catch with a fingertip, and the
+   fader is the one control on this dialog that has to be draggable mid-show.
+   The track stays 6px, so the thumb's negative margin grows with it. */
+@media (pointer: coarse) {
+	.pw-mixer-strip input[type='range'].pw-mixer-slider {
+		height: 2rem;
+	}
+
+	.pw-mixer-strip input[type='range'].pw-mixer-slider::-webkit-slider-thumb {
+		width: 26px;
+		height: 26px;
+		margin-top: -10px;
+	}
+
+	.pw-mixer-strip input[type='range'].pw-mixer-slider::-moz-range-thumb {
+		width: 26px;
+		height: 26px;
+	}
+}
+
+/* Live level meter shown beside the preview player. Driven by the browser from
+   the stream it is already playing, so it can run at animation rate; a plain
+   div pair rather than <meter>, whose native rendering cannot be themed
+   consistently across browsers. */
+.pw-mixer-meter {
+	width: 4rem;
+	height: 8px;
+	border-radius: 4px;
+	overflow: hidden;
+	background-color: var(--bs-tertiary-color);
+}
+
+.pw-mixer-meter-lg {
+	width: 6rem;
+}
+
+.pw-mixer-meter-fill {
+	height: 100%;
+	width: 0;
+	border-radius: 4px;
+	background-color: var(--bs-success);
+}
+
+/* Near clipping. */
+.pw-mixer-meter-fill.pw-mixer-meter-hot {
+	background-color: var(--bs-warning);
+}
+
+/* The preview player is appended below the strips inside the scrolling body.
+   On a phone that puts it off-screen as soon as you scroll to the fader you
+   wanted to listen to, so it stays pinned to the bottom of the scroller; the
+   alert it contains supplies its own background. */
+.pw-mixer-preview-host {
+	position: sticky;
+	bottom: 0;
+	z-index: 3;
+}
+
+/* A default <audio> control is ~300px wide and will not shrink on its own,
+   which is enough to overflow a portrait phone. */
+.pw-mixer-preview-host audio {
+	flex: 1 1 14rem;
+	min-width: 0;
+	max-width: 100%;
 }

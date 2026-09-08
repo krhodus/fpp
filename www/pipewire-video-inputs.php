@@ -11,6 +11,8 @@
 
     <title><? echo $pageTitle; ?> - PipeWire Video Input Sources</title>
 
+    <?php $modalMode = isset($_GET['modal']) && $_GET['modal'] == '1'; ?>
+
     <style>
         .source-card {
             border: 1px solid var(--bs-border-color, #dee2e6);
@@ -101,15 +103,15 @@
         }
 
         .status-running {
-            background: #28a745;
+            background: var(--bs-success, #28a745);
         }
 
         .status-stopped {
-            background: #dc3545;
+            background: var(--bs-danger, #dc3545);
         }
 
         .status-unknown {
-            background: #ffc107;
+            background: var(--bs-warning, #ffc107);
         }
 
         .pipewire-badge {
@@ -164,15 +166,18 @@
     </style>
 </head>
 
-<body>
-    <div id="bodyWrapper">
-        <?php
-        $activeParentMenuItem = 'status';
-        include 'menu.inc';
-        ?>
-        <div class="mainContainer">
-            <h1 class="title">PipeWire Video Input Sources</h1>
-            <div class="pageContent">
+<body<?php if ($modalMode)
+    echo ' class="modal-mode m-0 p-3"'; ?>>
+    <?php if (!$modalMode) { ?>
+        <div id="bodyWrapper">
+            <?php
+            $activeParentMenuItem = 'status';
+            include 'menu.inc';
+            ?>
+            <div class="mainContainer">
+                <h1 class="title">PipeWire Video Input Sources</h1>
+                <div class="pageContent">
+                <?php } ?>
 
                 <?php
                 $mediaBackend = isset($settings['MediaBackend']) ? $settings['MediaBackend'] : 'alsa';
@@ -185,7 +190,7 @@
                 if ($mediaBackend !== 'pipewire') {
                     ?>
                     <div class="alsa-warning">
-                        <i class="fas fa-exclamation-triangle fa-2x" style="color: var(--bs-warning, #ffc107);"></i>
+                        <i class="fas fa-exclamation-triangle fa-2x text-warning"></i>
                         <h4>Advanced PipeWire Required</h4>
                         <p>Video Input Sources require the Advanced PipeWire backend.<br>
                             Currently using: <strong><?= htmlspecialchars($mbDisplay) ?></strong></p>
@@ -204,16 +209,36 @@
                         on HDMI outputs, pixel overlays, or network streams.
                     </div>
 
+                    <?php $ytdlpVersion = trim(shell_exec('yt-dlp --version 2>/dev/null')); ?>
+                    <div class="alert alert-secondary d-flex flex-wrap align-items-center gap-3">
+                        <div class="me-auto">
+                            <i class="fas fa-cloud-download-alt"></i>
+                            <strong>Web/HTTP URL</strong> sources resolve YouTube links with <code>yt-dlp</code>
+                            <?php if ($ytdlpVersion != "") { ?>
+                                &mdash; installed version <code><?= htmlspecialchars($ytdlpVersion) ?></code>.
+                            <?php } else { ?>
+                                &mdash; <span class="text-danger">not installed</span>.
+                            <?php } ?>
+                            <br>
+                            <small class="text-body-secondary">YouTube reworks its player every few months, and a
+                                yt-dlp older than that stops resolving links entirely &mdash; the source starts but
+                                never produces a frame. FPP checks weekly for a newer one.</small>
+                        </div>
+                        <?php PrintSettingCheckbox('Keep yt-dlp updated', 'ytdlpAutoUpdate', 0, 0, '1', '0', '', '', 1); ?>
+                    </div>
+
                     <div id="pipewireStatus" class="toolbar">
                         <div class="toolbar-left">
                             <span id="pwStatus"><span class="status-indicator status-unknown"></span> Checking PipeWire
                                 status...</span>
                         </div>
                         <div class="toolbar-right">
-                            <a class="btn btn-sm btn-outline-secondary" href="settings.php#settings-av"
-                                title="Back to Pipewire Settings">
-                                <i class="fas fa-arrow-left"></i> Pipewire Settings
-                            </a>
+                            <?php if (!$modalMode) { ?>
+                                <a class="btn btn-sm btn-outline-secondary" href="settings.php#settings-av"
+                                    title="Back to Pipewire Settings">
+                                    <i class="fas fa-arrow-left"></i> Pipewire Settings
+                                </a>
+                            <?php } ?>
                             <button class="buttons btn-outline-success" onclick="AddSource()">
                                 <i class="fas fa-plus"></i> Add Source
                             </button>
@@ -228,7 +253,7 @@
 
                     <div id="sourcesContainer">
                         <div class="no-sources-msg" id="noSourcesMsg">
-                            <i class="fas fa-video" style="font-size:2rem; color:var(--bs-secondary-color,#6c757d);"></i>
+                            <i class="fas fa-video fs-1 text-secondary"></i>
                             <h4>No Video Input Sources Configured</h4>
                             <p>Add a source to create a persistent video signal in the PipeWire graph
                                 (test patterns, cameras, etc.).</p>
@@ -238,7 +263,7 @@
                         </div>
                     </div>
 
-                    <div id="bottomToolbar" class="toolbar" style="display:none; margin-top:1rem;">
+                    <div id="bottomToolbar" class="toolbar d-none mt-3">
                         <div class="toolbar-left"></div>
                         <div class="toolbar-right">
                             <button class="buttons" onclick="SaveSources()">
@@ -252,11 +277,28 @@
 
                 <?php } ?>
 
+                <?php if (!$modalMode) { ?>
+                </div>
+            </div>
+
+            <?php include 'common/footer.inc'; ?>
+        </div>
+    <?php } else { ?>
+        <div class="modal fade" id="modalDialogBase" tabindex="-1" data-bs-backdrop="static" data-bs-keyboard="false"
+            aria-labelledby="modalDialogLabel" aria-hidden="true">
+            <div class="modal-dialog">
+                <div class="modal-content">
+                    <div class="modal-header">
+                        <h3 class="modal-title fs-5" id="modalDialogLabel"></h3>
+                        <button id="modalCloseButton" type="button" class="btn-close" data-bs-dismiss="modal"
+                            aria-label="Close"></button>
+                    </div>
+                    <div class="modal-body"></div>
+                    <div class="modal-footer"></div>
+                </div>
             </div>
         </div>
-
-        <?php include 'common/footer.inc'; ?>
-    </div>
+    <?php } ?>
 
     <script>
         // Available V4L2 devices
@@ -367,7 +409,344 @@
                 '</div>';
         }
 
+        // ------------------------------------------------------------------
+        // Live preview
+        //
+        // The preview endpoint returns a single JPEG, so "live" here is a
+        // polled still rather than a video stream -- no second decode
+        // pipeline is held open for every config page someone leaves sitting
+        // on a monitor.
+        //
+        // Two things decide how fluid that looks:
+        //
+        //  * Pacing.  This used to sleep a flat 500ms *after* each frame
+        //    finished loading, so the real interval was 500ms + round-trip
+        //    (measured 33-77ms) -- about 1.8fps, with the cadence visibly
+        //    wandering as the round-trip moved.  Scheduling on a fixed
+        //    period instead makes the spacing even, which reads as much
+        //    smoother than the raw frame count suggests.
+        //
+        //  * Whether anyone is looking.  A frame costs roughly 2% of a core
+        //    on a Pi (snapshot pipeline build, 1080p->320 scale, JPEG
+        //    encode), so 10fps is around 20% of one core.  That is only
+        //    affordable because a preview that is scrolled out of view or in
+        //    a background tab stops asking for frames entirely.
+        var previewTimers = {};
+
+        // Per-preview pacing state, keyed by source id: { rtt, targetMs }.
+        var previewPacing = {};
+
+        var PREVIEW_TARGET_MS = 100;   // 10fps ceiling
+        var PREVIEW_MAX_MS = 1000;     // floor of 1fps when the server is slow
+        var PREVIEW_IDLE_MS = 1000;    // re-check rate while nothing is watching
+
+        // Is this preview worth spending a frame on right now?
+        function PreviewWorthDrawing(img) {
+            if (document.visibilityState === 'hidden') return false;
+
+            // The <img> carries d-none until the first frame lands, so it
+            // measures 0x0 at exactly the moment we most need to fetch.
+            // Measure its container in that case, and if nothing can be
+            // measured at all, fail open -- a preview that stalls forever is
+            // far worse than one that draws a frame nobody is looking at.
+            var el = (img.getBoundingClientRect().height > 0) ? img : (img.parentElement || img);
+            var r = el.getBoundingClientRect();
+            if (r.width === 0 && r.height === 0) return true;
+
+            var vh = window.innerHeight || document.documentElement.clientHeight;
+            return r.bottom > 0 && r.top < vh;
+        }
+
+        // Warn when the configured size/rate isn't one the camera advertises.
+        // FPP scales and re-times whatever the camera gives it, so a mismatch
+        // is not fatal -- but a native mode costs less CPU and looks better.
+        function BuildNativeModeHint(source) {
+            var dev = null;
+            for (var i = 0; i < availableV4l2Devices.length; i++) {
+                if (availableV4l2Devices[i].device === source.device) {
+                    dev = availableV4l2Devices[i];
+                    break;
+                }
+            }
+            if (!dev || !dev.modes || dev.modes.length === 0) return '';
+
+            var exact = false;
+            var sizes = {};
+            for (var j = 0; j < dev.modes.length; j++) {
+                var m = dev.modes[j];
+                sizes[m.width + 'x' + m.height] = true;
+                if (m.width === source.width && m.height === source.height) exact = true;
+            }
+            if (exact) return '';
+
+            var list = Object.keys(sizes).slice(0, 8).join(', ');
+            return '<div class="row mt-1"><div class="col-auto">' +
+                '<small class="text-warning"><i class="fas fa-info-circle"></i> ' +
+                EscapeAttr(source.width + 'x' + source.height) + ' is not a native mode for this camera ' +
+                '(FPP will scale). Native sizes: ' + EscapeAttr(list) + '</small>' +
+                '</div></div>';
+        }
+
+        // Device-level controls for a capture card / webcam.
+        //
+        // These are deliberately separate from the Resolution/FPS row: those
+        // describe the stream FPP produces, while these are settings pushed
+        // into the camera itself.  Flicker under mains lighting is the case
+        // that forces the distinction -- it is decided at exposure time, so
+        // nothing downstream of the capture can undo it.
+        function BuildV4L2ControlsBlock(source, index) {
+            var dev = null;
+            for (var i = 0; i < availableV4l2Devices.length; i++) {
+                if (availableV4l2Devices[i].device === source.device) {
+                    dev = availableV4l2Devices[i];
+                    break;
+                }
+            }
+
+            var plf = (typeof source.powerLineFrequency === 'number') ? source.powerLineFrequency : -1;
+            var expMode = source.exposureMode || 'camera';
+            var dynFps = (typeof source.dynamicFramerate === 'number') ? source.dynamicFramerate : -1;
+
+            function Options(opts, current) {
+                var out = '';
+                for (var i = 0; i < opts.length; i++) {
+                    var sel = (opts[i].v === current) ? ' selected' : '';
+                    out += '<option value="' + opts[i].v + '"' + sel + '>' + EscapeAttr(opts[i].label) + '</option>';
+                }
+                return out;
+            }
+
+            var html = '<div class="row align-items-center mt-2">';
+            html += '<div class="col-auto"><label>Anti-flicker:</label></div>';
+            html += '<div class="col-auto">';
+            html += '<select class="form-select form-select-sm w-auto" onchange="UpdateSourceField(' + index + ',\'powerLineFrequency\',parseInt(this.value))">';
+            html += Options([
+                { v: -1, label: 'Camera default (leave unchanged)' },
+                { v: 0, label: 'Off' },
+                { v: 1, label: '50 Hz mains (UK, Europe, Asia, Africa, Australia)' },
+                { v: 2, label: '60 Hz mains (Americas, Japan, Taiwan, South Korea)' }
+            ], plf);
+            html += '</select>';
+            html += '</div>';
+
+            // What the camera is set to *right now* -- the mismatch between
+            // this and the room is the whole diagnosis, and it is invisible
+            // otherwise.
+            if (dev && dev.powerLineFrequency !== null && typeof dev.powerLineFrequency !== 'undefined') {
+                var names = { 0: 'Off', 1: '50 Hz', 2: '60 Hz' };
+                var cur = names[dev.powerLineFrequency] || 'unknown';
+                html += '<div class="col-auto"><small class="text-muted">Camera currently reports <b>' + EscapeAttr(cur) + '</b></small></div>';
+            }
+            html += '</div>';
+
+            html += '<div class="row"><div class="col-auto">';
+            html += '<small class="text-muted">Locks the camera\'s exposure to whole cycles of the mains supply. ' +
+                    'Rolling bands or a pulsing brightness under artificial lighting nearly always means this is set ' +
+                    'for the wrong region &mdash; changing the FPS above will not fix it.</small>';
+            html += '</div></div>';
+
+            // Only offered when the camera actually implements the control;
+            // otherwise the select would silently do nothing.
+            if (!dev || dev.hasExposureControls) {
+                html += '<div class="row align-items-center mt-2">';
+                html += '<div class="col-auto"><label>Exposure:</label></div>';
+                html += '<div class="col-auto">';
+                html += '<select class="form-select form-select-sm w-auto" onchange="UpdateExposureMode(' + index + ',this.value)">';
+                html += Options([
+                    { v: 'camera', label: 'Camera default (leave unchanged)' },
+                    { v: 'auto', label: 'Auto' },
+                    { v: 'manual', label: 'Manual' }
+                ], expMode);
+                html += '</select>';
+                html += '</div>';
+
+                var shutterMs = (typeof source.exposureTime100us === 'number' && source.exposureTime100us > 0)
+                    ? (source.exposureTime100us / 10) : 10;
+                html += '<div class="col-auto' + (expMode === 'manual' ? '' : ' d-none') + '" id="shutterGroup_' + index + '">';
+                html += '<label class="me-1">Shutter:</label>';
+                html += '<input type="number" class="form-control form-control-sm d-inline-block w-auto" value="' + shutterMs + '" ' +
+                        'onchange="UpdateShutterMs(' + index + ',this.value)" min="0.1" max="1000" step="0.1"> ms';
+                html += '</div>';
+                html += '</div>';
+
+                html += '<div class="row' + (expMode === 'manual' ? '' : ' d-none') + '" id="shutterHint_' + index + '"><div class="col-auto">';
+                html += '<small class="text-muted">Use 10 ms (or any multiple) under 50 Hz mains, 8.33 ms under 60 Hz. ' +
+                        'A fixed shutter also stops the picture breathing as the lighting state changes mid-show.</small>';
+                html += '</div></div>';
+
+                html += '<div class="row align-items-center mt-2">';
+                html += '<div class="col-auto"><label>Auto-exposure may lower FPS:</label></div>';
+                html += '<div class="col-auto">';
+                html += '<select class="form-select form-select-sm w-auto" onchange="UpdateSourceField(' + index + ',\'dynamicFramerate\',parseInt(this.value))">';
+                html += Options([
+                    { v: -1, label: 'Camera default (leave unchanged)' },
+                    { v: 0, label: 'No \u2014 hold the frame rate' },
+                    { v: 1, label: 'Yes \u2014 allow longer exposures in low light' }
+                ], dynFps);
+                html += '</select>';
+                html += '</div>';
+                html += '</div>';
+            }
+
+            return html;
+        }
+
+        function BuildPreviewBlock(source) {
+            var id = parseInt(source.id, 10);
+
+            // A v4l2 source can be previewed straight off the device, and a
+            // test pattern can be rendered from nothing at all, so both work
+            // while stopped -- the operator can confirm the camera, or see
+            // what a pattern looks like, before committing.  Every other type
+            // is only reachable through fppd's running pipeline, so say so
+            // rather than letting them press a button that can only fail.
+            var hint = '<small>Preview stopped.</small>';
+            if (!source.enabled && source.type !== 'v4l2src' && source.type !== 'videotestsrc') {
+                hint = '<small>Enable this source and click <b>Save &amp; Apply</b> to preview it.</small>';
+            }
+
+            return '<div class="row align-items-start mt-2">' +
+                '<div class="col-auto"><label>Preview:</label></div>' +
+                '<div class="col-auto">' +
+                '<div class="d-flex flex-column gap-1">' +
+                '<img id="videoPreviewImg' + id + '" class="border rounded d-none" alt="Video input preview" width="320">' +
+                '<div id="videoPreviewMsg' + id + '" class="text-muted">' + hint + '</div>' +
+                '<div class="d-flex gap-2">' +
+                '<button type="button" class="btn btn-sm btn-outline-primary" id="videoPreviewBtn' + id + '" onclick="TogglePreview(' + id + ')">' +
+                '<i class="fas fa-play"></i> Start Preview</button>' +
+                '</div></div></div></div>';
+        }
+
+        function TogglePreview(id) {
+            if (previewTimers[id]) {
+                StopPreview(id);
+            } else {
+                StartPreview(id);
+            }
+        }
+
+        function StopPreview(id) {
+            if (previewTimers[id]) {
+                clearTimeout(previewTimers[id]);
+                delete previewTimers[id];
+            }
+            delete previewPacing[id];
+            $('#videoPreviewImg' + id).addClass('d-none').removeAttr('src');
+            $('#videoPreviewMsg' + id).removeClass('text-danger').addClass('text-muted')
+                .html('<small>Preview stopped.</small>');
+            $('#videoPreviewBtn' + id).html('<i class="fas fa-play"></i> Start Preview');
+        }
+
+        function StartPreview(id) {
+            $('#videoPreviewBtn' + id).html('<i class="fas fa-stop"></i> Stop Preview');
+            $('#videoPreviewMsg' + id).removeClass('text-danger').addClass('text-muted')
+                .html('<small>Connecting&hellip;</small>');
+            previewTimers[id] = setTimeout(function () { PreviewTick(id); }, 0);
+        }
+
+        // Chained timeouts rather than setInterval: a slow or failing grab
+        // must not stack up requests behind itself, and a device that has
+        // gone away should back off instead of hammering gst-launch.
+        function FindSourceById(id) {
+            var list = videoInputSources.videoInputSources || [];
+            for (var i = 0; i < list.length; i++) {
+                if (parseInt(list[i].id, 10) === parseInt(id, 10)) return list[i];
+            }
+            return null;
+        }
+
+        function PreviewTick(id) {
+            if (!previewTimers[id]) return;
+            var img = document.getElementById('videoPreviewImg' + id);
+            if (!img) {           // row was re-rendered out from under us
+                StopPreview(id);
+                return;
+            }
+
+            function schedule(delay) {
+                previewTimers[id] = setTimeout(function () { PreviewTick(id); }, delay);
+            }
+
+            // Nothing is looking at it: skip the frame entirely rather than
+            // paying for one nobody sees.  This is what pays for the higher
+            // rate above.
+            if (!PreviewWorthDrawing(img)) {
+                schedule(PREVIEW_IDLE_MS);
+                return;
+            }
+
+            var pace = previewPacing[id];
+            if (!pace) {
+                pace = previewPacing[id] = { rtt: 0, targetMs: PREVIEW_TARGET_MS };
+            }
+
+            var started = Date.now();
+            var url = 'api/pipewire/video/input-sources/' + id + '/preview?width=320&_=' + started;
+
+            // A test pattern is generated from nothing, so the server can
+            // render whatever is selected right now rather than what was last
+            // saved.  Without this the preview answers with the saved pattern
+            // and appears frozen while the dropdown changes.
+            var src = FindSourceById(id);
+            if (src && src.type === 'videotestsrc') {
+                url += '&pattern=' + encodeURIComponent(src.pattern || 'smpte') +
+                       '&srcw=' + (parseInt(src.width, 10) || 320) +
+                       '&srch=' + (parseInt(src.height, 10) || 240);
+            }
+            var probe = new Image();
+
+            probe.onload = function () {
+                if (!previewTimers[id]) return;
+                img.src = probe.src;
+                $('#videoPreviewImg' + id).removeClass('d-none');
+                $('#videoPreviewMsg' + id).addClass('d-none');
+
+                // Never ask for frames faster than the server has actually
+                // been delivering them.  Smoothing the round-trip rather than
+                // reacting to the last one keeps a single slow frame from
+                // lurching the rate, and the 1.1 margin leaves the daemon
+                // some headroom instead of running it at exactly saturation.
+                // On a slower Pi, or a 4K source, this settles at whatever
+                // rate is sustainable instead of queueing up requests.
+                var elapsed = Date.now() - started;
+                pace.rtt = pace.rtt ? (pace.rtt * 0.7 + elapsed * 0.3) : elapsed;
+                pace.targetMs = Math.min(PREVIEW_MAX_MS,
+                                         Math.max(PREVIEW_TARGET_MS, Math.round(pace.rtt * 1.1)));
+
+                // Fixed period, not a fixed gap: the time already spent
+                // fetching comes out of the wait, so the spacing stays even.
+                schedule(Math.max(0, pace.targetMs - elapsed));
+            };
+
+            probe.onerror = function () {
+                if (!previewTimers[id]) return;
+                $('#videoPreviewImg' + id).addClass('d-none');
+                $('#videoPreviewMsg' + id).removeClass('d-none text-muted').addClass('text-danger')
+                    .html('<small><i class="fas fa-exclamation-triangle"></i> No frames. ' +
+                          'Check the device is connected, then Save &amp; Apply and retry.</small>');
+                // Nothing learned about pacing from a failure -- start clean
+                // when frames come back.
+                pace.rtt = 0;
+                pace.targetMs = PREVIEW_TARGET_MS;
+                schedule(3000);
+            };
+            probe.src = url;
+        }
+
+        // Re-rendering the source list destroys the <img> elements the
+        // running previews write into, so drop the timers with them.
+        function StopAllPreviews() {
+            for (var id in previewTimers) {
+                if (previewTimers.hasOwnProperty(id)) {
+                    clearTimeout(previewTimers[id]);
+                }
+            }
+            previewTimers = {};
+            previewPacing = {};
+        }
+
         function RenderSources() {
+            StopAllPreviews();
             var container = $('#sourcesContainer');
             container.empty();
             container.append(UnsavedChangesBanner());
@@ -375,7 +754,7 @@
             if (videoInputSources.videoInputSources.length === 0) {
                 container.append(
                     '<div class="no-sources-msg" id="noSourcesMsg">' +
-                    '<i class="fas fa-video" style="font-size:2rem; color:var(--bs-secondary-color,#6c757d);"></i>' +
+                    '<i class="fas fa-video fs-1 text-secondary"></i>' +
                     '<h4>No Video Input Sources Configured</h4>' +
                     '<p>Add a source to create a persistent video signal in the PipeWire graph.</p>' +
                     '<button class="buttons btn-outline-success" onclick="AddSource()">' +
@@ -385,15 +764,11 @@
                 // Keep the toolbar (and its Save buttons) available when the last source
                 // has just been deleted, otherwise the deletion can never be saved and
                 // the source reappears on reload.
-                if (hasUnsavedChanges) {
-                    $('#bottomToolbar').show();
-                } else {
-                    $('#bottomToolbar').hide();
-                }
+                $('#bottomToolbar').toggleClass('d-none', !hasUnsavedChanges);
                 return;
             }
 
-            $('#bottomToolbar').show();
+            $('#bottomToolbar').removeClass('d-none');
 
             for (var i = 0; i < videoInputSources.videoInputSources.length; i++) {
                 container.append(RenderSourceCard(videoInputSources.videoInputSources[i], i));
@@ -413,8 +788,8 @@
             html += '<input type="checkbox" class="form-check-input" onchange="ToggleSourceEnabled(' + index + ', this.checked)"' + enabledChecked + ' title="Enable/Disable source">';
             html += '<input type="text" class="source-name-input" value="' + EscapeAttr(source.name || '') + '" onchange="UpdateSourceName(' + index + ', this.value)" placeholder="Source Name">';
             html += '<span class="badge bg-success pipewire-badge" title="PipeWire node name">' + EscapeAttr(nodeName) + '</span>';
-            html += '<div style="flex:1"></div>';
-            html += '<button class="buttons btn-outline-danger" onclick="DeleteSource(' + index + ')" title="Delete Source" style="padding:0.25rem 0.5rem;"><i class="fas fa-trash"></i></button>';
+            html += '<div class="flex-grow-1"></div>';
+            html += '<button class="buttons btn-outline-danger" onclick="DeleteSource(' + index + ')" title="Delete Source"><i class="fas fa-trash"></i></button>';
             html += '</div>';
 
             // Body
@@ -424,7 +799,7 @@
             html += '<div class="row align-items-center">';
             html += '<div class="col-auto"><label>Type:</label></div>';
             html += '<div class="col-auto">';
-            html += '<select class="form-select form-select-sm" style="width:auto;" onchange="UpdateSourceType(' + index + ',this.value)">';
+            html += '<select class="form-select form-select-sm w-auto" onchange="UpdateSourceType(' + index + ',this.value)">';
             html += '<option value="videotestsrc"' + (source.type === 'videotestsrc' ? ' selected' : '') + '>Test Pattern</option>';
             html += '<option value="v4l2src"' + (source.type === 'v4l2src' ? ' selected' : '') + '>USB Camera (V4L2)</option>';
             html += '<option value="rtspsrc"' + (source.type === 'rtspsrc' ? ' selected' : '') + '>RTSP Network Stream</option>';
@@ -442,7 +817,7 @@
             html += '<div class="col-auto"><label>Resolution:</label></div>';
             html += '<div class="col-auto">';
             var presetVal = (source.width || 320) + 'x' + (source.height || 240);
-            html += '<select class="form-select form-select-sm" style="width:auto;display:inline-block;" onchange="ApplyResolutionPreset(' + index + ',this.value)">';
+            html += '<select class="form-select form-select-sm w-auto d-inline-block" onchange="ApplyResolutionPreset(' + index + ',this.value)">';
             var presets = [
                 { label: 'Custom', w: 0, h: 0 },
                 { label: '240p', w: 426, h: 240 },
@@ -469,8 +844,8 @@
             html += '</select>';
             html += '</div>';
             html += '<div class="col-auto">';
-            html += '<input type="number" class="form-control form-control-sm" id="resW_' + index + '" style="width:80px;display:inline-block;" value="' + (source.width || 320) + '" onchange="UpdateResolution(' + index + ')" min="16" max="7680"> x ';
-            html += '<input type="number" class="form-control form-control-sm" id="resH_' + index + '" style="width:80px;display:inline-block;" value="' + (source.height || 240) + '" onchange="UpdateResolution(' + index + ')" min="16" max="4320">';
+            html += '<input type="number" class="form-control form-control-sm d-inline-block" id="resW_' + index + '" style="width:80px;" value="' + (source.width || 320) + '" onchange="UpdateResolution(' + index + ')" min="16" max="7680"> x ';
+            html += '<input type="number" class="form-control form-control-sm d-inline-block" id="resH_' + index + '" style="width:80px;" value="' + (source.height || 240) + '" onchange="UpdateResolution(' + index + ')" min="16" max="4320">';
             html += '</div>';
             html += '<div class="col-auto"><label>FPS:</label></div>';
             html += '<div class="col-auto">';
@@ -491,7 +866,7 @@
                     html += '<div class="row align-items-center mt-2">';
                     html += '<div class="col-auto"><label>Pattern:</label></div>';
                     html += '<div class="col-auto">';
-                    html += '<select class="form-select form-select-sm" style="width:auto;" onchange="UpdateSourceField(' + index + ',\'pattern\',this.value)">';
+                    html += '<select class="form-select form-select-sm w-auto" onchange="UpdateSourceField(' + index + ',\'pattern\',this.value)">';
                     for (var i = 0; i < testPatterns.length; i++) {
                         var p = testPatterns[i];
                         var sel = ((source.pattern || 'smpte') === p.value) ? ' selected' : '';
@@ -507,7 +882,7 @@
                     html += '<div class="col-auto"><label>Device:</label></div>';
                     html += '<div class="col-auto">';
                     if (availableV4l2Devices.length > 0) {
-                        html += '<select class="form-select form-select-sm" style="width:auto;" onchange="UpdateSourceField(' + index + ',\'device\',this.value)">';
+                        html += '<select class="form-select form-select-sm w-auto" onchange="UpdateSourceField(' + index + ',\'device\',this.value)">';
                         html += '<option value="">-- Select Device --</option>';
                         for (var i = 0; i < availableV4l2Devices.length; i++) {
                             var d = availableV4l2Devices[i];
@@ -516,18 +891,20 @@
                         }
                         html += '</select>';
                     } else {
-                        html += '<input type="text" class="form-control form-control-sm" style="width:200px;" value="' + EscapeAttr(source.device || '/dev/video0') + '" onchange="UpdateSourceField(' + index + ',\'device\',this.value)" placeholder="/dev/video0">';
-                        html += ' <span class="text-muted" style="font-size:0.85rem;">(no V4L2 devices detected)</span>';
+                        html += '<input type="text" class="form-control form-control-sm w-auto" value="' + EscapeAttr(source.device || '/dev/video0') + '" onchange="UpdateSourceField(' + index + ',\'device\',this.value)" placeholder="/dev/video0">';
+                        html += ' <span class="text-muted"><small>(no capture devices detected &mdash; check the camera is plugged in)</small></span>';
                     }
                     html += '</div>';
                     html += '</div>';
+                    html += BuildNativeModeHint(source);
+                    html += BuildV4L2ControlsBlock(source, index);
                     break;
 
                 case 'rtspsrc':
                     html += '<div class="row align-items-center mt-2">';
                     html += '<div class="col-auto"><label>RTSP URL:</label></div>';
                     html += '<div class="col-auto">';
-                    html += '<input type="text" class="form-control form-control-sm" style="width:350px;" value="' + EscapeAttr(source.uri || '') + '" onchange="UpdateSourceField(' + index + ',\'uri\',this.value)" placeholder="rtsp://host:554/path">';
+                    html += '<input type="text" class="form-control form-control-sm placeholder-muted" style="width:350px;" value="' + EscapeAttr(source.uri || '') + '" onchange="UpdateSourceField(' + index + ',\'uri\',this.value)" placeholder="rtsp://host:554/path">';
                     html += '</div>';
                     html += '</div>';
                     html += '<div class="row align-items-center mt-1">';
@@ -542,7 +919,7 @@
                     html += '<div class="row align-items-center mt-2">';
                     html += '<div class="col-auto"><label>URL:</label></div>';
                     html += '<div class="col-auto">';
-                    html += '<input type="text" class="form-control form-control-sm" style="width:420px;" value="' + EscapeAttr(source.uri || '') + '" onchange="UpdateSourceField(' + index + ',\'uri\',this.value)" placeholder="https://www.youtube.com/watch?v=... or HLS URL">';
+                    html += '<input type="text" class="form-control form-control-sm placeholder-muted" style="width:420px;" value="' + EscapeAttr(source.uri || '') + '" onchange="UpdateSourceField(' + index + ',\'uri\',this.value)" placeholder="https://www.youtube.com/watch?v=... or HLS URL">';
                     html += '</div>';
                     html += '</div>';
                     html += '<div class="row align-items-center mt-1">';
@@ -550,22 +927,22 @@
                     html += '<div class="col-auto">';
                     html += '<input type="number" class="form-control form-control-sm" style="width:80px;" value="' + (source.bufferSec != null ? source.bufferSec : 3) + '" onchange="UpdateSourceField(' + index + ',\'bufferSec\',parseFloat(this.value))" min="0" max="30" step="0.5">';
                     html += '</div>';
-                    html += '<div class="col-auto text-muted" style="font-size:0.85rem;">YouTube URL, HTTP, HLS, or any GStreamer-supported URI</div>';
+                    html += '<div class="col-auto text-muted"><small>YouTube URL, HTTP, HLS, or any GStreamer-supported URI</small></div>';
                     html += '</div>';
                     // Audio extraction (YouTube only)
                     html += '<div class="row align-items-center mt-2">';
                     html += '<div class="col-auto"><label>Audio:</label></div>';
                     html += '<div class="col-auto">';
                     html += '<input type="checkbox" class="form-check-input" id="audioEn_' + index + '"' + (source.audioEnabled ? ' checked' : '') + ' onchange="ToggleAudioEnabled(' + index + ', this.checked)"> ';
-                    html += '<label class="form-check-label" for="audioEn_' + index + '" style="font-weight:normal;">Extract audio from stream</label>';
+                    html += '<label class="form-check-label fw-normal" for="audioEn_' + index + '">Extract audio from stream</label>';
                     html += '</div>';
                     if (source.audioEnabled) {
                         var audioNode = source.audioPipeWireNodeName || ('fpp_audio_src_' + source.id + '_' + EscapeNodeName(source.name || 'source'));
-                        html += '<span class="badge bg-info pipewire-badge" title="PipeWire audio source node" style="margin-left:0.5rem;">' + EscapeAttr(audioNode) + '</span>';
+                        html += '<span class="badge bg-info pipewire-badge ms-2" title="PipeWire audio source node">' + EscapeAttr(audioNode) + '</span>';
                     }
                     html += '</div>';
                     if (source.audioEnabled) {
-                        html += '<div class="row mt-1"><div class="col text-muted" style="font-size:0.8rem; padding-left:5.5rem;">Audio is extracted as a separate PipeWire source node. Add it to an Audio Input Group to route it to an Output Group.</div></div>';
+                        html += '<div class="row mt-1"><div class="col text-muted" style="padding-left:5.5rem;"><small>Audio is extracted as a separate PipeWire source node. Add it to an Audio Input Group to route it to an Output Group.</small></div></div>';
                     }
                     break;
 
@@ -579,7 +956,7 @@
                     html += '<div class="row align-items-center mt-1">';
                     html += '<div class="col-auto"><label>Encoding:</label></div>';
                     html += '<div class="col-auto">';
-                    html += '<select class="form-select form-select-sm" style="width:auto;" onchange="UpdateSourceField(' + index + ',\'encoding\',this.value)">';
+                    html += '<select class="form-select form-select-sm w-auto" onchange="UpdateSourceField(' + index + ',\'encoding\',this.value)">';
                     var encodings = [{ v: 'H264', l: 'H.264' }, { v: 'H265', l: 'H.265 (HEVC)' }, { v: 'MP2T', l: 'MPEG-TS' }, { v: 'RAW', l: 'Raw Video' }, { v: 'JPEG', l: 'Motion JPEG' }];
                     for (var e = 0; e < encodings.length; e++) {
                         var sel = ((source.encoding || 'H264') === encodings[e].v) ? ' selected' : '';
@@ -591,11 +968,17 @@
                     html += '<div class="row align-items-center mt-1">';
                     html += '<div class="col-auto"><label>Multicast Group:</label></div>';
                     html += '<div class="col-auto">';
-                    html += '<input type="text" class="form-control form-control-sm" style="width:180px;" value="' + EscapeAttr(source.multicastGroup || '') + '" onchange="UpdateSourceField(' + index + ',\'multicastGroup\',this.value)" placeholder="(optional, e.g. 239.1.1.1)">';
+                    html += '<input type="text" class="form-control form-control-sm placeholder-muted" style="width:180px;" value="' + EscapeAttr(source.multicastGroup || '') + '" onchange="UpdateSourceField(' + index + ',\'multicastGroup\',this.value)" placeholder="(optional, e.g. 239.1.1.1)">';
                     html += '</div>';
                     html += '</div>';
                     break;
             }
+
+            // Every source type benefits from a preview, not just cameras:
+            // it is the quickest way to tell a mis-typed RTSP URL or a dead
+            // stream from a routing problem further downstream.
+            html += BuildPreviewBlock(source);
+
             return html;
         }
 
@@ -656,6 +1039,10 @@
             delete src.encoding;
             delete src.multicastGroup;
             delete src.audioEnabled;
+            delete src.powerLineFrequency;
+            delete src.exposureMode;
+            delete src.exposureTime100us;
+            delete src.dynamicFramerate;
             if (type === 'videotestsrc') {
                 src.pattern = 'smpte';
             } else if (type === 'v4l2src') {
@@ -676,6 +1063,26 @@
 
         function UpdateSourceField(index, field, value) {
             videoInputSources.videoInputSources[index][field] = value;
+        }
+
+        function UpdateExposureMode(index, mode) {
+            videoInputSources.videoInputSources[index].exposureMode = mode;
+            // Toggled in place rather than via RenderSources(), which stops
+            // every running preview.
+            $('#shutterGroup_' + index).toggleClass('d-none', mode !== 'manual');
+            $('#shutterHint_' + index).toggleClass('d-none', mode !== 'manual');
+            if (mode === 'manual' && !videoInputSources.videoInputSources[index].exposureTime100us) {
+                // 10ms: one full 50Hz half-cycle, and a sane starting point.
+                videoInputSources.videoInputSources[index].exposureTime100us = 100;
+            }
+        }
+
+        function UpdateShutterMs(index, val) {
+            // Stored in the V4L2 control's own 100us units so the config maps
+            // 1:1 onto exposure_time_absolute; milliseconds are just the UI.
+            var ms = parseFloat(val);
+            if (isNaN(ms) || ms <= 0) return;
+            videoInputSources.videoInputSources[index].exposureTime100us = Math.round(ms * 10);
         }
 
         function ApplyResolutionPreset(index, val) {

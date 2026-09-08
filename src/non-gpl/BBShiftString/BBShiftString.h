@@ -170,7 +170,12 @@ private:
         // zero while it is keeping up
         std::chrono::steady_clock::time_point stalledSince{};
         // pump-internal streaming state
-        uint32_t pumpedSeq = 0;
+        // atomic: the pump thread writes this while the output thread reads it
+        // in SendData's back-pressure gate.  It is published with release only
+        // once the pump's copy of pendingFrame is known good - the gate reads
+        // it as permission to restage, so an early store would hand the output
+        // thread a frame the pump is still reading.
+        std::atomic<uint32_t> pumpedSeq{ 0 };
         PumpFrame activeFrame;
         uint32_t activeOff = 0;
         bool pumpActive = false;
@@ -216,6 +221,23 @@ private:
     uint32_t m_curFrame = 0;
     uint32_t m_licensedOutputs = 0;
 
+    // back-pressure gate accounting, touched only on the output thread.
+    // Members rather than function statics so a config reload starts a fresh
+    // window and so a removed output cannot leave its warning stuck in the UI.
+    uint32_t m_bpOffered = 0;
+    uint32_t m_bpDeclined = 0;
+    bool m_bpWarned = false;
+    std::chrono::steady_clock::time_point m_bpWindowStart{};
+    void setFrameRateWarning(bool on);
+
+    // predictive frame-rate budget: computed once in Init() from the longest
+    // string, compared against the sequence rate whenever output starts
+    int m_frameTimeUs = 0;
+    float m_lastBudgetRate = -1.0f;
+    std::string m_budgetWarnText;
+    void checkFrameRateBudget(float rate);
+    void clearBudgetWarning();
+
     int m_testCycle = -1;
     int m_testType = 0;
     float m_testPercent = 0.0f;
@@ -226,6 +248,9 @@ private:
     // any configured Falcon V5 (bidirectional) receivers after the
     // capability checks; V4 (send-only) chains do not set this
     bool m_hasBidirSR = false;
+    // the cape wires the enable line to PRU1 and we configured that pin;
+    // this also means PRU1 must be running, see Init()
+    bool m_usesEnablePin = false;
 
     void prepData(FrameData& d, unsigned char* channelData);
     void sendData(FrameData& d);

@@ -15,10 +15,14 @@
 #include "fpp-json-fwd.h"
 #include <sys/types.h>
 #include <atomic>
+#include <deque>
+#include <functional>
 #include <mutex>
 #include <pthread.h>
 #include <map>
 #include <set>
+#include <string>
+#include <vector>
 
 #include "SysSocket.h"
 #include "settings.h"
@@ -122,6 +126,78 @@ typedef enum systemType {
     kSysTypeSanDevices = 0xFF
 } MultiSyncSystemType;
 
+// The two records below hold the slow-changing detail the multisync UI needs
+// about every discovered FPP remote -- OS version, host description, background
+// color, git branch/commit, whether channel inputs/outputs are enabled, and what
+// cape is installed.  None of it fits in (or belongs in) the UDP ping packet, so
+// fppd collects it over HTTP instead; see MultiSync::CheckSystemInfoRefreshes().
+//
+// Both deliberately hold plain members rather than a Json::Value: MultiSync.h
+// only forward-declares Json::Value (fpp-json-fwd.h), and spelling the fields
+// out documents exactly what is relayed to peers.
+class MultiSyncSystemInfo {
+public:
+    bool valid = false;
+
+    std::string platform;
+    std::string variant;
+    std::string subPlatform;
+    std::string osVersion;
+    std::string osRelease;
+    std::string kernel;
+    std::string hostDescription;
+    std::string backgroundColor;
+    std::string branch;
+    std::string localGitVersion;
+    std::string remoteGitVersion;
+    std::string upgradeSource;
+    std::vector<std::string> ips;
+    // Tri-state: -1 when the remote is too old to report the field at all, in
+    // which case the UI still has to go look for itself.
+    int channelInputsEnabled = -1;
+    int channelOutputsEnabled = -1;
+
+    Json::Value toJSON() const;
+};
+
+class MultiSyncCapeInfo {
+public:
+    bool valid = false;
+    // False when the remote answered but has no cape installed (/api/cape
+    // returns 404).  That is a real answer and worth caching, as distinct from
+    // valid == false meaning "we have not managed to ask yet".
+    bool present = false;
+
+    std::string id;
+    std::string name;
+    std::string description;
+    std::string version;
+    std::string designer;
+    // Deliberately NOT carrying the cape's serialNumber: it is a per-board
+    // hardware identifier with no use in the UI, and this record is handed to
+    // every peer that asks for the systems list.
+    std::string vendorName;
+    std::string vendorURL;
+    std::string vendorEmail;
+    std::string vendorImage;
+    // The cape's own opt-out of hardware detail in the usage statistics. Only
+    // a signed cape can carry it -- CapeUtils strips it from an unsigned one --
+    // and it is relayed so that a peer-side collector can honour the flag of
+    // the cape it actually describes, rather than the reporting host's.
+    // Default true: absent means the cape never asked to be excluded.
+    bool sendStats = true;
+
+    Json::Value toJSON() const;
+    // Build from a /api/cape style object (a remote's reply, or the local
+    // media/tmp/cape-info.json).  Result is valid+present.
+    static MultiSyncCapeInfo fromCapeJSON(const Json::Value& v);
+};
+
+// Identity synthesised from a device's MAC when it reports no UUID of its own.
+// The prefix marks it as a stand-in so a real UUID arriving later can replace
+// it -- see MultiSyncSystem::update().
+#define MAC_UUID_PREFIX "MAC:"
+
 class MultiSyncSystem {
 public:
     MultiSyncSystem() {
@@ -145,6 +221,19 @@ public:
     std::string model;
     std::string ranges;
     std::string uuid;
+
+    // Fetched by MultiSync::CheckSystemInfoRefreshes(), relayed by toJSON().
+    // All six are guarded by MultiSync::m_systemsLock.
+    MultiSyncSystemInfo systemInfo; // subset of the remote's /api/system/info
+    MultiSyncCapeInfo capeInfo;     // subset of the remote's /api/cape
+    std::string infoFetchedVersion; // 'version' the cached info was fetched for
+    // Earliest wall clock at which this remote may be fetched again.  0 means
+    // "due, but not yet scheduled": the sweep turns that into a jittered time
+    // rather than fetching immediately, so a fleet-wide event doesn't converge
+    // on one target.  See CheckSystemInfoRefreshes().
+    time_t infoNextFetch = 0;
+    bool infoFetchPending = false;  // a fetch is in flight right now
+
     unsigned char ipa = 0;
     unsigned char ipb = 0;
     unsigned char ipc = 0;
@@ -317,7 +406,10 @@ public:
     static std::string GetTypeString(MultiSyncSystemType type, bool local = false);
     static MultiSyncSystemType ModelStringToType(std::string model);
 
-    void StoreHTTPResponse(std::string* ipp, uint8_t* data, int sz);
+    // Was the curl write callback for the HTTP discovery scan, which now
+    // receives whole responses from CurlManager instead.  Retained as a no-op
+    // only because it is public and an external plugin could reference it.
+    void StoreHTTPResponse(std::string* ipp, uint8_t* data, int sz) {}
 
     [[nodiscard]] std::vector<MultiSyncSystem> const& GetLocalSystems() { return m_localSystems; }
     [[nodiscard]] std::vector<MultiSyncSystem> const& GetRemoteSystems() { return m_remoteSystems; }
@@ -370,7 +462,18 @@ private:
 
     void PerformHTTPDiscovery(void);
     void DiscoverViaHTTP(const std::set<std::string>& ips, const std::set<std::string>& exacts);
-    void DiscoverIPViaHTTP(const std::string& ip, bool allowUnknown = false);
+    void DiscoverIPViaHTTP(const std::string& ip, const std::string& html, bool allowUnknown = false);
+
+    // Both HTTP probe paths are queue-and-pump rather than fire-everything:
+    // each hands its addresses to a queue and then starts as many requests as
+    // the in-flight cap allows, and each completion starts the next one.  See
+    // the cap defines in MultiSync.cpp for why an unbounded fan-out is the
+    // wrong thing on a show network.
+    void PumpHTTPPings();
+    void StartHTTPPing(const std::string& address);
+    void FinishHTTPPing();
+    void PumpHTTPDiscovery();
+    void FinishHTTPDiscovery();
 
     void ProcessSyncPacket(ControlPkt* pkt, int len, MultiSyncStats* stats);
     void ProcessCommandPacket(ControlPkt* pkt, int len, MultiSyncStats* stats);
@@ -381,6 +484,13 @@ private:
     std::recursive_mutex m_systemsLock;
     std::vector<MultiSyncSystem> m_localSystems;
     std::vector<MultiSyncSystem> m_remoteSystems;
+    // Identities learned second-hand: some vendors report a stable id for each
+    // neighbour they can see but none for themselves, so a device's identity
+    // arrives while a DIFFERENT address is being probed.  Kept rather than
+    // applied and discarded, because the neighbour is often identified before
+    // the device it describes has been discovered at all.  Guarded by
+    // m_systemsLock.  Keyed by address.
+    std::map<std::string, std::string> m_peerUUIDHints;
 
     // Channel-output ranges parsed from co-universes.json, keyed by each output
     // target's configured address and its resolved IP. Used to backfill the
@@ -421,11 +531,47 @@ private:
     // it, for the brief swap step only.
     std::mutex m_unicastUpdateLock;
 
+    // Async HTTP enrichment of discovered FPP remotes; see the comment above
+    // the definition of CheckSystemInfoRefreshes() in MultiSync.cpp.
+    void CheckSystemInfoRefreshes();
+    // Marks a remote's cached detail stale so a later sweep re-fetches it (at a
+    // jittered time, not immediately -- see CheckSystemInfoRefreshes()).  Called
+    // when the remote announces itself with a discover ping, i.e. its fppd just
+    // started.  Public because ProcessPingPacket reaches it through the global
+    // multiSync pointer.
+public:
+    void InvalidateSystemInfo(const std::string& address);
+
+private:
+    // Makes every entry for one device agree on its identity; see the comment
+    // above the definition.  Caller must hold m_systemsLock.
+    void ReconcileDeviceIdentity(const std::string& hostname, FPPMode fppMode);
+    void ApplyPeerUUIDs(const std::map<std::string, std::string>& peerUUIDs);
+    // Fills in a system's identity from m_peerUUIDHints.  Caller holds
+    // m_systemsLock.
+    void ApplyUUIDHint(MultiSyncSystem& sys);
+    void FetchSystemInfo(const std::string& address);
+    void FetchCapeInfo(const std::string& address);
+    // Runs `apply` on every remote entry describing the same device as
+    // `address` -- the same address, or the same non-empty uuid.  A device with
+    // more than one NIC has one entry per address (the UI merges them into a
+    // single row by uuid), and one fetch should update all of them.  Takes
+    // m_systemsLock.
+    void ForEachRemoteMatching(const std::string& address,
+                               const std::function<void(MultiSyncSystem&)>& apply);
+
+    // Wall clock of the next CheckSystemInfoRefreshes() sweep, and how many of
+    // its HTTP fetches are outstanding.  Both are touched only on the main loop
+    // -- the sweep and the CurlManager completions run on the same thread.  The
+    // counter would be stranded high (and infoFetchPending stuck set) if a
+    // request were ever cancelled without running its callback, but
+    // CurlManager::cancelRequests() only ever cancels a named owner and these
+    // are issued with FPP's own empty owner, so that cannot happen.
+    time_t m_nextInfoScan = 0;
+    std::atomic<int> m_infoFetchesInFlight{ 0 };
+
     unsigned long m_lastPingTime;
     unsigned long m_lastCheckTime;
-    // Set while a background thread is running the blocking HTTP remote probes
-    // kicked off by PeriodicPing(), so we never pile up overlapping probe threads.
-    std::atomic_bool m_httpPingInProgress{ false };
     int m_lastMediaHalfSecond;
     int m_lastFrame;
     int m_lastFrameSent;
@@ -469,8 +615,16 @@ private:
     unsigned char rcvCmbuf[MAX_MS_RCV_MSG][0x100];
     struct sockaddr_storage rcvSrcAddr[MAX_MS_RCV_MSG];
 
-    std::mutex m_httpResponsesLock;
-    std::map<std::string, std::vector<uint8_t>> m_httpResponses;
+    // Pending work for the two HTTP probe paths, plus how many of each are
+    // outstanding.  A lock rather than bare atomics because a CurlManager
+    // completion does not reliably land on the main loop: processCurls() is
+    // also called from UDPOutput's init and teardown, so a callback can run on
+    // whichever thread is reloading channel outputs.
+    std::mutex m_httpProbeLock;
+    std::deque<std::string> m_httpPingQueue;
+    int m_httpPingsInFlight = 0;
+    std::deque<std::pair<std::string, bool>> m_httpDiscoveryQueue; // address, isExact
+    int m_httpDiscoveriesInFlight = 0;
 
     std::recursive_mutex m_statsLock;
     std::map<std::string, MultiSyncStats*> m_syncStats;

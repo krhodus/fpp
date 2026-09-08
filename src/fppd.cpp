@@ -166,7 +166,12 @@ static bool dumpstack_gdb(const char** reason = nullptr) {
     char thread_buf[30];
     snprintf(thread_buf, sizeof(thread_buf), "(LWP %ld)", syscall(__NR_gettid));
     char name_buf[512];
-    name_buf[readlink("/proc/self/exe", name_buf, 511)] = 0;
+    ssize_t nLink = readlink("/proc/self/exe", name_buf, sizeof(name_buf) - 1);
+    if (nLink > 0 && nLink < (ssize_t)sizeof(name_buf)) {
+        name_buf[nLink] = '\0';
+    } else {
+        name_buf[0] = '\0';
+    }
 
     constexpr static int kTimeoutSec = 30;
 
@@ -445,6 +450,10 @@ static void handleCrash(int s, siginfo_t* si, void* ctx) {
         sigaction(SIGALRM, &almAct, nullptr);
         alarm(kCrashHandlerWatchdogSec);
     }
+    // Deliberately still 3, pending the opt-in UI (privacy consent screen +
+    // upgrade prompt). Drop to 0 in the same change that ships that UI -- a
+    // default that sends is only defensible while there is no way for the user
+    // to have answered the question.
     int crashLog = getSettingInt("ShareCrashData", 3);
 #ifndef PLATFORM_OSX
     LogErr(VB_ALL, "Crash handler called in thread %u:  signal=%d (SIG%s: %s) addr=%p si_code=%d\n",
@@ -1956,8 +1965,13 @@ void MainLoop(void) {
             multiSync->PeriodicPing();
             if (--publishCounter < 0) {
                 PublishStatsBackground(publishReason);
-                // counting down is less CPU then the time check every cycle
-                publishCounter = 60480;
+                // This counter only decides how often the (very cheap) time
+                // check inside PublishStatsBackground runs; that check enforces
+                // the real cadence.  It has to be comfortably finer than the
+                // cadence or it becomes the limiting factor: doPing runs about
+                // once a second when idle, so the previous 60480 was roughly 17
+                // hours and a 24-hour guard would have landed near 34.
+                publishCounter = 3600;
                 publishReason = "normal";
             }
             // also do the periodic work in the api server while idle
@@ -2030,15 +2044,31 @@ void PublishStatsForce(std::string reason) {
     LogInfo(VB_GENERAL, "Publishing statistics because of \"%s\" = %s\n", reason.c_str(), result.c_str());
 }
 
-void PublishStatsBackground(std::string reason) {
-    // No need to publish more than once every 10 days if fppd is up that long
-    static auto lastPublish = std::chrono::system_clock::now() - std::chrono::hours(10 * 24);
-    auto now_ts = std::chrono::system_clock::now();
-    auto hours = std::chrono::duration_cast<std::chrono::hours>(now_ts - lastPublish);
+// How often this daemon ASKS the statistics route whether to publish.  It is
+// deliberately much shorter than the publish interval itself, which lives in the
+// route (STATS_PUBLISH_INTERVAL_DAYS) because that is the side that can see the
+// payload and hold a timestamp across restarts.
+//
+// The two must not be equal.  This counter resets on every restart, so if it
+// matched the publish interval a box that rebooted just before the interval
+// elapsed would be told "not yet", spend its guard, and not ask again for a full
+// interval -- pushing the periodic publish out to nearly double, and with it the
+// only signal that says the device is still alive.  Asking daily bounds that
+// error at one day.
+#define STATS_PUBLISH_ASK_HOURS 24
 
-    // Check 10 days
-    if (hours.count() >= (10 * 24)) {
-        lastPublish = now_ts;
+void PublishStatsBackground(std::string reason) {
+    // Rate limit on ASKING, not on sending.  Whether anything is actually
+    // uploaded is the route's decision: a restart publishes when the device's
+    // configuration signature has moved and stays quiet when it has not, and a
+    // device that never changes still checks in on the publish interval so the
+    // project can see it is alive.
+    static auto lastAsk = std::chrono::system_clock::now() - std::chrono::hours(STATS_PUBLISH_ASK_HOURS);
+    auto now_ts = std::chrono::system_clock::now();
+    auto hours = std::chrono::duration_cast<std::chrono::hours>(now_ts - lastAsk);
+
+    if (hours.count() >= STATS_PUBLISH_ASK_HOURS) {
+        lastAsk = now_ts;
         if (getSetting("statsPublish") == "Enabled") {
             std::thread t(PublishStatsForce, reason);
             t.detach();
@@ -2046,6 +2076,6 @@ void PublishStatsBackground(std::string reason) {
             LogInfo(VB_GENERAL, "Not Publishing statistics as mode is '%s'\n", getSetting("statsPublish").c_str());
         }
     } else {
-        LogDebug(VB_GENERAL, "PublishStats called, but not been 10 days yet.\n");
+        LogDebug(VB_GENERAL, "PublishStats called, but not time to ask yet.\n");
     }
 }

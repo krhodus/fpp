@@ -106,6 +106,64 @@ std::string getSimpleXMLTag(const std::string& xml, const std::string& tag);
 // so curl accepts them; IPv4 addresses and hostnames are passed through
 // unchanged.  This is what makes discovery work on IPv6-only networks.
 std::string buildHttpURL(const std::string& address, const std::string& path = "");
+
+// True for an IPv4 127/8 or IPv6 ::1 address.  Discovery treats loopback as
+// "this box finding itself" and never as a peer -- see MultiSync::UpdateSystem().
+bool IsLoopbackAddress(const std::string& address);
+
+// Resolve `host` to a single IPv4 address, stored in `addr` in network byte
+// order.  A dotted-quad is parsed directly; anything else goes to getaddrinfo()
+// and is remembered -- successes and failures alike -- in a small process-wide
+// cache with a short TTL.
+//
+// The negative caching is the point.  An unresolvable name costs a flat ~4s
+// through systemd-resolved, and a name only has to appear once in
+// co-universes.json to be looked up from several places during startup; six
+// such lookups for two dead output hostnames were 23s of a 26s fppd start.
+// Callers must still hold onto the address they get -- this is a stampede
+// guard, not a substitute for the resolver.
+//
+// TTLs are deliberately short in both directions: long enough to collapse a
+// startup burst, short enough that a controller which comes up (or moves) is
+// picked up on the next poll rather than at the next restart.
+bool ResolveHostToIPv4(const std::string& host, uint32_t& addr);
+
+// As above, returning the dotted-quad form, or "" if it could not be resolved.
+std::string ResolveHostToIPv4(const std::string& host);
+
+// Drop every cached entry.  Call this when the network underneath the resolver
+// changes (an interface gaining or losing an address), so a name that failed
+// while the link was down is retried immediately instead of after the TTL.
+void FlushHostResolveCache();
+
+// Reduces a MAC in any of the usual spellings to 12 uppercase hex digits with
+// no separators, or "" if it isn't one.  Every path that derives an identity
+// from a hardware address must go through this, so that the same device gets
+// the same string whichever way it was found.
+std::string NormalizeMacAddress(const std::string& mac);
+
+// The MAC of an on-link IPv4 neighbour, as 12 uppercase hex digits with no
+// separators, or "" if it isn't known.  Read from the kernel's ARP table, so it
+// only answers for hosts on a directly attached subnet -- a routed host simply
+// has no entry, which is what we want (we must never hand back the gateway's
+// MAC for a device behind it).  Used to give controllers that report no UUID of
+// their own a stable identity; see MultiSyncSystem::update().
+std::string GetMacForAddress(const std::string& address);
+// DEPRECATED.  These drive a private curl easy handle to completion inline, so
+// the calling thread is stopped for as long as the request takes -- up to the
+// connect timeout plus `timeout` per call, and a caller that makes several in a
+// row pays that for each one.  New FPP code must use CurlManager instead: its
+// add()/addGet()/addPost()/addPut() queue onto the shared multi handle and hand
+// the answer to a callback run from the main loop, so nothing blocks.
+//
+// They are kept, and will stay kept, because external channel-output plugins
+// link against them.  They are also still the only correct choice for the FPP
+// code that has no main loop to complete against: fppmm and fppoled are their
+// own binaries, and CurlManager's synchronous doGet()/doPut() are not usable
+// off the main-loop thread -- they spin on processCurls(), which drains and
+// invokes *every* subsystem's pending callbacks on whatever thread calls it.
+// Until CurlManager grows a thread-safe blocking call, "deprecated" here means
+// "do not reach for this in new fppd code", not "unusable".
 bool urlHelper(const std::string method, const std::string& url, const std::string& data, std::string& resp, const std::list<std::string>& headers, const unsigned int timeout = 30);
 bool urlHelper(const std::string method, const std::string& url, const std::string& data, std::string& resp, const unsigned int timeout = 30);
 bool urlHelper(const std::string method, const std::string& url, std::string& resp, const unsigned int timeout = 30);

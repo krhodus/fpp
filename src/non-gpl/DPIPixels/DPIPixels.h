@@ -52,6 +52,8 @@ private:
     void WriteLatchedDataAtPosition(uint8_t *&ptr, const uint32_t value, const uint32_t latches);
 
     bool InitializeWS281x(void);
+    void CopyShadowToAllPages(void);
+    int IdleFpsFromSetting(void);
 
     std::string device = "DPI-1";
     std::string protocol = "ws2811";
@@ -65,6 +67,16 @@ private:
 
     FrameBuffer* fb = nullptr;
     int fbPage = -1;
+
+    // The KMS pages are uncached DMA memory: streaming writes are fine but any
+    // read-back is ~30x slower than RAM, and scattered writes into a page the
+    // DPI is still scanning can tear a bit's middle third.  So the WS bit
+    // stream is built in this ordinary malloc'd copy of a page (template from
+    // InitializeWS281x(), middle thirds from PrepData()) and SendData() copies
+    // the data rows into the free page in one burst once the previous flip has
+    // retired.  Two KMS pages are enough for that; no third buffer in CMA.
+    uint8_t* m_shadow = nullptr;
+    int m_shadowCopyBytes = 0; // data rows only; the reset rows never change
 
     int latchCount = 0;
     int longestString = 0;
@@ -87,6 +99,7 @@ private:
     // only the vertical blanking (see KMSFrameBuffer::SetRefreshRate).
     int m_configuredMaxFps = 0; // highest rate the longest string allows
     int m_currentFps = 0;       // last rate applied to the framebuffer
+    int m_idleFps = 20;         // 1000 / E131BridgingInterval, kept current by a settings listener
     bool m_initialized = false; // gates runtime rate control (off during Init/Close)
     // GetTime() when output went idle, for the settle window in PrepData().
     // 0 means "a sequence is running, or none has stopped yet".
@@ -118,14 +131,14 @@ inline void DPIPixelsOutput::WriteDataAtPosition(uint8_t *&ptr, const uint32_t v
     uint32_t v3 = (value << 8) | (value >> 16);
     uint32_t *tptr = (uint32_t*)ptr;
 
-    // Write out first 4 FB pixels
-    *(tptr++) = v1;
-    *(tptr++) = v2;
-    *(tptr++) = v3;
-
-    // Copy data from first four to next 8
-    memcpy(ptr + 12, ptr, 12);
-    memcpy(ptr + 24, ptr, 24);
+    // 4 FB pixels per 3 words, repeated 4 times.  Written as pure stores (no
+    // read-back of what was just written) so this stays cheap even if the
+    // destination is ever uncached memory.
+    for (int i = 0; i < 4; i++) {
+        *(tptr++) = v1;
+        *(tptr++) = v2;
+        *(tptr++) = v3;
+    }
 
     ptr += 48; // 12 uint32_t
 }

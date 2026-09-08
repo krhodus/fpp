@@ -46,6 +46,7 @@
 #include <utility>
 #include <vector>
 
+#include "CurlManager.h"
 #include "FileMonitor.h"
 #include "NetworkController.h"
 #include "NetworkMonitor.h"
@@ -85,30 +86,20 @@ NetInterfaceInfo::~NetInterfaceInfo() {
 }
 
 static bool GetIPForHost(std::string& target) {
-    // gethostbyname()/inet_ntoa() return pointers into static, per-process
-    // buffers and are not thread-safe. MultiSync resolves hosts from several
-    // threads concurrently (e.g. PingSingleRemoteViaHTTP and the main-loop
-    // ProcessControlPacket path), and a concurrent call could corrupt the
-    // static hostent, leaving h_addr dangling and crashing here. getaddrinfo()
-    // and inet_ntop() are reentrant. We still resolve to the first IPv4 address
-    // and rewrite target as a dotted-quad, because callers depend on that form
-    // (split(target, '.') and inet_addr(target)).
-    struct addrinfo hints{};
-    hints.ai_family = AF_INET;      // IPv4 only -- callers expect a dotted-quad
-    hints.ai_socktype = SOCK_DGRAM; // one result per address, not one per socktype
-
-    struct addrinfo* res = nullptr;
-    if (getaddrinfo(target.c_str(), nullptr, &hints, &res) != 0 || res == nullptr) {
+    // ResolveHostToIPv4() is reentrant (gethostbyname()/inet_ntoa() return
+    // pointers into static, per-process buffers, and MultiSync resolves from
+    // several threads concurrently -- DiscoverIPViaHTTP runs from a curl
+    // completion while the main-loop ProcessControlPacket path resolves too).
+    // It also caches, which matters here: this is called once per configured
+    // output address from three separate points during startup, and a name that
+    // does not resolve costs seconds every time.  We still rewrite target as a
+    // dotted-quad, because callers depend on that form (split(target, '.') and
+    // inet_addr(target)).
+    std::string ip = ResolveHostToIPv4(target);
+    if (ip.empty()) {
         return false;
     }
-    char buf[INET_ADDRSTRLEN] = {0};
-    struct sockaddr_in* addr = (struct sockaddr_in*)res->ai_addr;
-    const char* str = inet_ntop(AF_INET, &addr->sin_addr, buf, sizeof(buf));
-    freeaddrinfo(res);
-    if (!str) {
-        return false;
-    }
-    target = buf;
+    target = ip;
     return true;
 }
 
@@ -123,9 +114,37 @@ void MultiSyncSystem::update(MultiSyncSystemType type,
                              const std::string& uuid,
                              const bool multiSync,
                              const bool sendingMultiSync) {
-    // Always update uuid if not Unknown
+    // UUID precedence.  A device that reports its own UUID always wins; the
+    // MAC-derived identity below is only ever a stand-in for one, so it must
+    // never overwrite a real UUID, and a real UUID arriving later must replace
+    // it.
     if (uuid != "Unknown" && uuid != "") {
-        this->uuid = uuid;
+        if (!startsWith(uuid, MAC_UUID_PREFIX) || this->uuid.empty() ||
+            startsWith(this->uuid, MAC_UUID_PREFIX)) {
+            this->uuid = uuid;
+        }
+    }
+
+    // Nothing reported a UUID for this device.  That is the normal case for
+    // every controller that isn't full FPP: the ping packet carries no UUID
+    // field at all, so ProcessPingPacket() has none to pass on, and
+    // NetworkController only fills one in for an FPP instance.  Without an
+    // identity the UI has to key the row on the hostname, which collides as
+    // soon as two controllers ship with the same default name and changes
+    // under it whenever someone renames one.
+    //
+    // The MAC is the stable identity such a device does have, and the kernel
+    // already knows it for anything on a directly attached subnet.  Only look
+    // it up while we still have nothing -- once an identity of either kind is
+    // recorded this stops running, so it costs one small read per device
+    // rather than one per ping.
+    if (this->uuid.empty()) {
+        // The parameter, not this->address: on a system being created that
+        // member is still empty here, and is only assigned further down.
+        std::string mac = GetMacForAddress(address);
+        if (!mac.empty()) {
+            this->uuid = MAC_UUID_PREFIX + mac;
+        }
     }
 
     // If this record is from info learned via the MultiSync protocol,
@@ -192,6 +211,89 @@ void MultiSyncSystem::update(MultiSyncSystemType type,
                             (this->fppMode == REMOTE_MODE);
 }
 
+static void SetIfNotEmpty(Json::Value& v, const char* key, const std::string& s) {
+    if (!s.empty()) {
+        v[key] = s;
+    }
+}
+
+Json::Value MultiSyncSystemInfo::toJSON() const {
+    Json::Value v;
+    SetIfNotEmpty(v, "Platform", platform);
+    SetIfNotEmpty(v, "Variant", variant);
+    SetIfNotEmpty(v, "SubPlatform", subPlatform);
+    SetIfNotEmpty(v, "OSVersion", osVersion);
+    SetIfNotEmpty(v, "OSRelease", osRelease);
+    SetIfNotEmpty(v, "Kernel", kernel);
+    SetIfNotEmpty(v, "HostDescription", hostDescription);
+    SetIfNotEmpty(v, "backgroundColor", backgroundColor);
+    SetIfNotEmpty(v, "Branch", branch);
+    SetIfNotEmpty(v, "LocalGitVersion", localGitVersion);
+    SetIfNotEmpty(v, "RemoteGitVersion", remoteGitVersion);
+    SetIfNotEmpty(v, "UpgradeSource", upgradeSource);
+    if (channelInputsEnabled >= 0) {
+        v["channelInputsEnabled"] = channelInputsEnabled ? true : false;
+    }
+    if (channelOutputsEnabled >= 0) {
+        v["channelOutputsEnabled"] = channelOutputsEnabled ? true : false;
+    }
+    if (!ips.empty()) {
+        Json::Value a(Json::arrayValue);
+        for (auto& ip : ips) {
+            a.append(ip);
+        }
+        v["IPs"] = a;
+    }
+    return v;
+}
+
+Json::Value MultiSyncCapeInfo::toJSON() const {
+    Json::Value v;
+    v["present"] = present;
+    if (!present) {
+        return v;
+    }
+    SetIfNotEmpty(v, "id", id);
+    SetIfNotEmpty(v, "name", name);
+    SetIfNotEmpty(v, "description", description);
+    SetIfNotEmpty(v, "version", version);
+    SetIfNotEmpty(v, "designer", designer);
+    // Only emitted when the cape opts out, so the common case adds no bytes.
+    if (!sendStats) {
+        v["sendStats"] = 0;
+    }
+    Json::Value vendor;
+    SetIfNotEmpty(vendor, "name", vendorName);
+    SetIfNotEmpty(vendor, "url", vendorURL);
+    SetIfNotEmpty(vendor, "email", vendorEmail);
+    SetIfNotEmpty(vendor, "image", vendorImage);
+    if (!vendor.empty()) {
+        v["vendor"] = vendor;
+    }
+    return v;
+}
+
+MultiSyncCapeInfo MultiSyncCapeInfo::fromCapeJSON(const Json::Value& v) {
+    MultiSyncCapeInfo cape;
+    cape.valid = true;
+    cape.present = true;
+    cape.id = v.get("id", "").asString();
+    cape.name = v.get("name", "").asString();
+    cape.description = v.get("description", "").asString();
+    cape.version = v.get("version", "").asString();
+    cape.designer = v.get("designer", "").asString();
+    // Absent (including on every unsigned cape) means no opt-out.
+    cape.sendStats = v.get("sendStats", 1).asInt() != 0;
+    if (JsonHas(v, "vendor") && v["vendor"].isObject()) {
+        const Json::Value& vendor = v["vendor"];
+        cape.vendorName = vendor.get("name", "").asString();
+        cape.vendorURL = vendor.get("url", "").asString();
+        cape.vendorEmail = vendor.get("email", "").asString();
+        cape.vendorImage = vendor.get("image", "").asString();
+    }
+    return cape;
+}
+
 Json::Value MultiSyncSystem::toJSON(bool local, bool timestamps) {
     Json::Value system;
 
@@ -225,6 +327,17 @@ Json::Value MultiSyncSystem::toJSON(bool local, bool timestamps) {
         system["HostDescription"] = getSetting("HostDescription");
         system["channelInputsEnabled"] = InputsEnabled();
         system["channelOutputsEnabled"] = HasUniverseOutputs();
+    }
+
+    // Detail fetched over HTTP from FPP remotes (see CheckSystemInfoRefreshes).
+    // Absent for the local systems -- a browser rendering the multisync page
+    // already has all of this for the box serving the page -- and for anything
+    // that isn't a full FPP instance.
+    if (systemInfo.valid) {
+        system["systemInfo"] = systemInfo.toJSON();
+    }
+    if (capeInfo.valid) {
+        system["capeInfo"] = capeInfo.toJSON();
     }
 
     return system;
@@ -281,7 +394,7 @@ int MultiSync::Init(void) {
     std::string coUniversesFile = FPP_DIR_CONFIG("/co-universes.json");
     FileMonitor::INSTANCE.AddFile("MultiSync/co-universes.json", coUniversesFile,
                                   [this]() { ReloadConfiguredOutputRanges(); })
-        .TriggerFileChanged(coUniversesFile);
+        .TriggerFileChanged("MultiSync/co-universes.json", coUniversesFile);
 
     if (!OpenReceiveSocket())
         return 0;
@@ -360,6 +473,21 @@ void MultiSync::UpdateSystem(MultiSyncSystemType type,
     std::string ipForAddress = address;
     GetIPForHost(ipForAddress);
 
+    // Loopback is this box finding itself, not a discoverable peer.  Avahi
+    // resolves our own _fppd._udp advertisement to 127.0.0.1, so mDNS hands it
+    // straight back to us; a channel output or an HTTP discovery subnet aimed
+    // at localhost does the same.  The resulting entry is useless to every
+    // consumer of the systems list -- no peer can reach it, and the multisync
+    // page drops the row rather than render a link a browser cannot follow.
+    // Reject it here, at the one place m_remoteSystems ever grows, so no
+    // discovery path can reintroduce it.  Local interface addresses come from
+    // FillInInterfaces(), which already skips "lo", so this never rejects one
+    // of our own entries.
+    if (IsLoopbackAddress(address) || IsLoopbackAddress(ipForAddress)) {
+        LogDebug(VB_SYNC, "Ignoring loopback address %s in discovery\n", address.c_str());
+        return;
+    }
+
     std::unique_lock<std::recursive_mutex> lock(m_systemsLock);
     bool found = false;
     bool unicastChanged = false;
@@ -371,6 +499,7 @@ void MultiSync::UpdateSystem(MultiSyncSystemType type,
             found = true;
             bool wasUnicast = sys.supportsUnicast;
             sys.update(type, majorVersion, minorVersion, fppMode, address, hostname, version, model, ranges, uuid, multiSync, sendingMultiSync);
+            ApplyUUIDHint(sys);
             sys.lastSeenStr = timeStr;
             sys.lastSeen = t;
             unicastChanged |= (wasUnicast != sys.supportsUnicast);
@@ -388,11 +517,14 @@ void MultiSync::UpdateSystem(MultiSyncSystemType type,
     if (!found) {
         MultiSyncSystem sys;
         sys.update(type, majorVersion, minorVersion, fppMode, address, hostname, version, model, ranges, uuid, multiSync, sendingMultiSync);
+        ApplyUUIDHint(sys);
         sys.lastSeenStr = timeStr;
         sys.lastSeen = t;
         unicastChanged |= sys.supportsUnicast;
         m_remoteSystems.push_back(sys);
     }
+
+    ReconcileDeviceIdentity(hostname, fppMode);
 
     // If a remote became (or stopped being) a unicast target, refresh the
     // cached "all known remotes" destination list.  The snapshot is taken here
@@ -572,6 +704,22 @@ bool MultiSync::FillLocalSystemInfo(void) {
     LogDebug(VB_SYNC, "Version: %s\n", newSystem.version.c_str());
     LogDebug(VB_SYNC, "Model: %s\n", newSystem.model.c_str());
 
+    // The local system's cape.  Remotes are probed for theirs over HTTP (see
+    // FetchCapeInfo); the local entry is never probed, so without this the
+    // systems list showed a cape on every box except the one serving the page.
+    // Same file the local /api/cape answers from; absent means no cape, which
+    // is an answer (present=false), not "unknown".
+    {
+        Json::Value capeJson;
+        std::string capeFile = FPP_DIR_MEDIA("/tmp/cape-info.json");
+        if (FileExists(capeFile) && LoadJsonFromFile(capeFile, capeJson) && capeJson.isObject()) {
+            newSystem.capeInfo = MultiSyncCapeInfo::fromCapeJSON(capeJson);
+        } else {
+            newSystem.capeInfo.valid = true;
+            newSystem.capeInfo.present = false;
+        }
+    }
+
     bool changed = false;
     std::unique_lock<std::recursive_mutex> lock(m_systemsLock);
 
@@ -585,6 +733,7 @@ bool MultiSync::FillLocalSystemInfo(void) {
         for (auto& sys : m_localSystems) {
             if (sys.address == address) {
                 found = true;
+                sys.capeInfo = newSystem.capeInfo;
             }
         }
         if (!found) {
@@ -1089,226 +1238,128 @@ void MultiSync::PerformHTTPDiscovery() {
     }
 }
 
-static size_t curl_write_data(void* ptr, size_t size, size_t nmemb, void* ourpointer) {
-    LogExcess(VB_SYNC, "write_data(%p, %d, %d, %p)\n", ptr, size, nmemb, ourpointer);
-    multiSync->StoreHTTPResponse((std::string*)ourpointer, (uint8_t*)ptr, size * nmemb);
-
-    return size * nmemb;
-}
-
-void MultiSync::StoreHTTPResponse(std::string* ipp, uint8_t* data, int sz) {
-    std::string ip = *ipp;
-    std::unique_lock<std::mutex> lock(m_httpResponsesLock);
-
-    int pos = m_httpResponses[ip].size();
-    m_httpResponses[ip].resize(m_httpResponses[ip].size() + sz);
-    memcpy(&m_httpResponses[ip][pos], data, sz);
-}
-
-void MultiSync::DiscoverIPViaHTTP(const std::string& ip, bool allowUnknown) {
+void MultiSync::DiscoverIPViaHTTP(const std::string& ip, const std::string& html, bool allowUnknown) {
     LogDebug(VB_SYNC, "Checking HTTP response from %s\n", ip.c_str());
 
-    std::unique_lock<std::mutex> lock(m_httpResponsesLock);
-    auto search = m_httpResponses.find(ip);
-    if (search == m_httpResponses.end()) {
-        LogErr(VB_SYNC, "Error, no value in m_httpResponses for %s IP\n", ip.c_str());
-        return;
-    }
-    /*
-    // if you need to debug thing, uncomment this.  Any \r in the string
-    // will likely make a printf("%s") not work as each "line" will overwrite itself
-    for (int x = 0; x < search->second.size(); x++) {
-        if (search->second[x] == '\n' || search->second[x] == '\r') {
-            search->second[x] = ' ';
-        }
-    }
-    */
-    std::string data((char*)&search->second[0], search->second.size());
-
-    // determine if the ip is on the local subnet.
-    // right now it assumes a /24 subnet, not ideal
-    bool isLocalSubnet = false;
-    in_addr_t add = inet_addr(ip.c_str());
-    unsigned char ipd = (add >> 24) & 0xFF;
-    unsigned char ipc = (add >> 16) & 0xFF;
-    unsigned char ipb = (add >> 8) & 0xFF;
-    unsigned char ipa = add & 0xFF;
-    std::unique_lock<std::recursive_mutex> slock(m_systemsLock);
-    for (auto& a : m_localSystems) {
-        if (ipa == a.ipa && ipb == a.ipb & ipc == a.ipc) {
-            isLocalSubnet = true;
-        }
-    }
-
-    if (data.size()) {
-        std::string d = data;
+    if (html.size()) {
+        std::string d = html;
         if (d.size() > 500) {
             d = d.substr(0, 500);
         }
         LogExcess(VB_SYNC, "IP: %s    Resp: %s\n", ip.c_str(), d.c_str());
     }
 
-    NetworkController* nc = nullptr;
-
     std::string address2 = ip;
     GetIPForHost(address2);
 
-    if (isSupportedForMultisync(ip.c_str(), "") && isSupportedForMultisync(address2.c_str(), "")) {
-        nc = NetworkController::DetectControllerViaHTML(ip, data);
+    if (!isSupportedForMultisync(ip.c_str(), "") || !isSupportedForMultisync(address2.c_str(), "")) {
+        if (allowUnknown) {
+            UpdateSystem(kSysTypeUnknown, 0, 0, UNKNOWN_MODE, ip, ip, "Unknown", "Unknown", "0-0", "Unknown", false, false);
+        }
+        FinishHTTPDiscovery();
+        return;
     }
 
-    if (nc) {
-        // This block was designed to avoid updating from NetworkControl if
-        // the device was found by ping.  However, UUID doesn't come from ping
-        // and the NC update has already be executed, so removing it out for now
-        // so that uuid gets updated.  update() function already has
-        // smarts not to override discovery protoocol data anyway.
-
-        /*
-        if (isLocalSubnet && nc->typeId < 0x80) {
-            std::unique_lock<std::recursive_mutex> lock(m_systemsLock);
-            bool found = false;
-            for (auto & sys : m_remoteSystems) {
-                if ((nc->ip == sys.address) &&
-                    ((nc->hostname == sys.hostname) ||
-                     (nc->ip == sys.hostname) ||
-                     (nc->hostname == sys.address))) {
-                    // we already found this via normal multicast discovery, ignore
-                    found = true;
-                }
-            }
-            if (found) {
-                delete nc;
-                nc = nullptr;
-            }
-        }
-        */
-
+    NetworkController::DetectControllerViaHTML(ip, html, [this, ip, allowUnknown](NetworkController* nc) {
         if (nc) {
             UpdateSystem(nc->typeId, nc->majorVersion, nc->minorVersion,
                          nc->systemMode, nc->ip, nc->hostname, nc->version,
                          nc->typeStr, nc->ranges, nc->uuid, false, nc->sendingMultiSync);
+            ApplyPeerUUIDs(nc->peerUUIDs);
             delete nc;
+        } else if (allowUnknown) {
+            UpdateSystem(kSysTypeUnknown, 0, 0, UNKNOWN_MODE, ip, ip, "Unknown", "Unknown", "0-0", "Unknown", false, false);
         }
-    } else if (allowUnknown) {
-        UpdateSystem(kSysTypeUnknown, 0, 0, UNKNOWN_MODE, ip, ip, "Unknown", "Unknown", "0-0", "Unknown", false, false);
-    }
+        FinishHTTPDiscovery();
+    });
+}
+
+// How many addresses in the configured HTTP scan are probed at once.  The
+// version this replaced put every address of every configured subnet on one
+// curl multi handle in a single burst and blocked until the last one answered;
+// a /24 is 254 sockets, and several subnets are common.  That is now spread out,
+// because it shares the multi handle with the rest of fppd rather than owning a
+// private one -- but it can still be wide, since almost every address in a scan
+// has nothing on it and simply burns the connect timeout.
+#define HTTP_DISCOVERY_MAX_IN_FLIGHT 48
+
+// The discovery probe cannot be a plain addGet(): it has to keep the options
+// the hand-rolled multi handle set.  HTTP09_ALLOWED is the load-bearing one --
+// some of the older controllers this is trying to identify answer with a bare
+// HTTP/0.9 body, which curl rejects by default.  The timeouts are far tighter
+// than CurlManager's defaults for the reason above: most addresses are dead.
+static void discoveryGet(const std::string& url, std::function<void(int rc, const std::string& resp)>&& callback) {
+    CURL* curl = CurlManager::INSTANCE.createCurl(url);
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 1000L);
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 5000L);
+    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(curl, CURLOPT_TCP_FASTOPEN, 1L);
+    curl_easy_setopt(curl, CURLOPT_HTTP09_ALLOWED, 1L);
+    CurlManager::INSTANCE.addCURL(url, curl, [callback](CURL* c) {
+        CurlManager::CurlPrivateData* data = nullptr;
+        long rc = 0;
+        curl_easy_getinfo(c, CURLINFO_PRIVATE, &data);
+        curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &rc);
+        std::string resp;
+        if (data && !data->resp.empty()) {
+            resp.assign(reinterpret_cast<char*>(data->resp.data()), data->resp.size());
+        }
+        callback((int)rc, resp);
+    });
 }
 
 void MultiSync::DiscoverViaHTTP(const std::set<std::string>& ipSet, const std::set<std::string>& exacts) {
-    std::vector<CURL*> handles;
-    std::vector<std::string> ipList;
-    handles.resize(ipSet.size());
-    ipList.resize(ipSet.size());
-    CURLM* multi_handle;
-    CURLMsg* msg;
-    int still_running = 0;
-    int msgs_left;
+    {
+        std::unique_lock<std::mutex> lock(m_httpProbeLock);
+        for (auto& ip : ipSet) {
+            LogExcess(VB_SYNC, "  %s\n", ip.c_str());
+            m_httpDiscoveryQueue.emplace_back(ip, exacts.find(ip) != exacts.end());
+        }
+    }
+    PumpHTTPDiscovery();
+}
 
-    std::string userAgent = "FPP/";
-    userAgent += getFPPVersionTriplet();
-
-    multi_handle = curl_multi_init();
-    int ips = 0;
-    for (auto& ip : ipSet) {
-        LogExcess(VB_SYNC, "  %s\n", ip.c_str());
-        handles[ips] = curl_easy_init();
-        ipList[ips] = ip;
-        m_httpResponses.erase(ip);
+// Starts scan probes until the cap is reached or the queue runs dry.  Called
+// from DiscoverViaHTTP() and again from each completion.
+void MultiSync::PumpHTTPDiscovery() {
+    while (true) {
+        std::string ip;
+        bool exact = false;
+        {
+            std::unique_lock<std::mutex> lock(m_httpProbeLock);
+            if (m_httpDiscoveryQueue.empty() || m_httpDiscoveriesInFlight >= HTTP_DISCOVERY_MAX_IN_FLIGHT) {
+                return;
+            }
+            std::tie(ip, exact) = m_httpDiscoveryQueue.front();
+            m_httpDiscoveryQueue.pop_front();
+            ++m_httpDiscoveriesInFlight;
+        }
 
         // ip may be a hostname, so this must not be a fixed-size buffer
         // (a fixed buffer would silently truncate hostnames and they'd
         //  never get discovered - see issue #2667)
-        std::string url = "http://" + ip + "/";
-        curl_easy_setopt(handles[ips], CURLOPT_URL, url.c_str());
-        curl_easy_setopt(handles[ips], CURLOPT_CONNECTTIMEOUT_MS, 1000L);
-        curl_easy_setopt(handles[ips], CURLOPT_TIMEOUT_MS, 5000L);
-        curl_easy_setopt(handles[ips], CURLOPT_FOLLOWLOCATION, 1L);
-        curl_easy_setopt(handles[ips], CURLOPT_USERAGENT, userAgent.c_str());
-        curl_easy_setopt(handles[ips], CURLOPT_PRIVATE, &ipList[ips]);
-        curl_easy_setopt(handles[ips], CURLOPT_WRITEFUNCTION, curl_write_data);
-        curl_easy_setopt(handles[ips], CURLOPT_WRITEDATA, &ipList[ips]);
-        curl_easy_setopt(handles[ips], CURLOPT_ACCEPT_ENCODING, "");
-        curl_easy_setopt(handles[ips], CURLOPT_TCP_FASTOPEN, 1L);
-        curl_easy_setopt(handles[ips], CURLOPT_HTTP09_ALLOWED, 1L);
-        curl_easy_setopt(handles[ips], CURLOPT_NOSIGNAL, 1);
-
-        curl_multi_add_handle(multi_handle, handles[ips]);
-        if ((ips % 10) == 0) {
-            // periodically need to do a perform so DNS can work, otherwise
-            // it seems to max out at aroung 70 or 80
-            curl_multi_perform(multi_handle, &still_running);
-        }
-        ips++;
-    }
-
-    int start = handles.size();
-    curl_multi_perform(multi_handle, &still_running);
-    while (still_running || start != still_running) {
-        if (start != still_running) {
-            int msgq = 0;
-            while ((msg = curl_multi_info_read(multi_handle, &msgq))) {
-                if (msg->msg == CURLMSG_DONE) {
-                    CURL* e = msg->easy_handle;
-                    int idx = -1;
-                    for (idx = 0; idx < ips; idx++) {
-                        if (e == handles[idx]) {
-                            break;
-                        }
-                    }
-                    if (idx == ips) {
-                        // Handle not one of ours; nothing to update in ipList, but
-                        // still remove/cleanup so it isn't leaked.
-                        curl_multi_remove_handle(multi_handle, e);
-                        curl_easy_cleanup(e);
-                        continue;
-                    }
-                    if (msg->data.result == CURLE_OK || msg->data.result == 0) {
-                        long responseCode = 0;
-                        curl_easy_getinfo(e, CURLINFO_HTTP_CODE, &responseCode);
-                        if (responseCode == 200 || (msg->data.result == 0 && responseCode == 0)) {
-                            LogDebug(VB_SYNC, "IP index %d (%s) completed with %d status, code: %d\n", idx, ipList[idx].c_str(), msg->data.result, responseCode);
-                        } else {
-                            LogDebug(VB_SYNC, "Error response from %s.  ResponseCode: %d\n", ipList[idx].c_str(), responseCode);
-                            ipList[idx] = "";
-                        }
-                    } else {
-                        LogDebug(VB_SYNC, "No/Error response from %s.  Response code: %d\n", ipList[idx].c_str(), msg->data.result);
-                        ipList[idx] = "";
-                    }
-                    curl_multi_remove_handle(multi_handle, e);
-                    curl_easy_cleanup(e);
-                    handles[idx] = nullptr;
-                }
+        discoveryGet(buildHttpURL(ip, "/"), [this, ip, exact](int rc, const std::string& resp) {
+            // A 200 is the normal answer.  rc == 0 with a body is the HTTP/0.9
+            // case -- there is no status line to report -- and is equally good;
+            // rc == 0 with nothing is a transfer that never connected.  This is
+            // the same accept/reject the CURLcode-based version made.
+            if (rc == 200 || (rc == 0 && !resp.empty())) {
+                LogDebug(VB_SYNC, "IP %s completed with code %d\n", ip.c_str(), rc);
+                DiscoverIPViaHTTP(ip, resp, exact);
+                return; // DiscoverIPViaHTTP() releases the slot
             }
-            start = still_running;
-        }
-        int numfds = 0;
-        // process ping packets in the loop as well
-        ProcessControlPacket(true);
-        int res = curl_multi_wait(multi_handle, NULL, 0, 100, &numfds);
-        if (res != CURLM_OK) {
-            LogErr(VB_SYNC, "error: curl_multi_wait() returned %d\n", res);
-            // Fall through to the cleanup below instead of leaking the
-            // remaining easy handles and the multi handle.
-            break;
-        }
-        curl_multi_perform(multi_handle, &still_running);
+            LogDebug(VB_SYNC, "No/Error response from %s.  Response code: %d\n", ip.c_str(), rc);
+            FinishHTTPDiscovery();
+        });
     }
+}
 
-    for (int idx = 0; idx < ips; idx++) {
-        if (ipList[idx] != "") {
-            bool exact = exacts.find(ipList[idx]) != exacts.end();
-            DiscoverIPViaHTTP(ipList[idx], exact);
-        }
+void MultiSync::FinishHTTPDiscovery() {
+    {
+        std::unique_lock<std::mutex> lock(m_httpProbeLock);
+        --m_httpDiscoveriesInFlight;
     }
-    for (int i = 0; i < ips; i++) {
-        if (handles[i]) {
-            curl_multi_remove_handle(multi_handle, handles[i]);
-            curl_easy_cleanup(handles[i]);
-        }
-    }
-    curl_multi_cleanup(multi_handle);
+    PumpHTTPDiscovery();
 }
 
 void MultiSync::WriteRuntimeInfoFile() {
@@ -1422,11 +1473,12 @@ void MultiSync::PeriodicPing() {
         unsigned long timeoutRePingAll = (unsigned long)t - 60 * 600;
         std::unique_lock<std::recursive_mutex> lock(m_systemsLock);
         bool unicastChanged = false;
-        // PingSingleRemoteViaHTTP -> UpdateSystem can push_back onto
-        // m_remoteSystems (the recursive mutex doesn't protect against our own
-        // thread), reallocating the vector and invalidating `it` mid-loop.
-        // Collect the addresses (by value) and do the HTTP probes after the
-        // loop, outside the lock - they are blocking curl calls anyway.
+        // Collect the addresses (by value) and queue the HTTP probes after the
+        // loop rather than from inside it.  The probes are asynchronous now, but
+        // the reason for the two-step is unchanged: a probe that resolves fast
+        // reaches UpdateSystem, which can push_back onto m_remoteSystems (the
+        // recursive mutex does not protect against our own thread) and
+        // reallocate the vector out from under `it`.
         std::vector<std::string> httpPingAddresses;
         for (auto it = m_remoteSystems.begin(); it != m_remoteSystems.end();) {
             if (it->lastSeen < timeoutRemove) {
@@ -1465,51 +1517,483 @@ void MultiSync::PeriodicPing() {
             UpdateUnicastDestinations(unicastAddrs);
         }
         if (!httpPingAddresses.empty()) {
-            // These are blocking curl probes (connect timeout of a couple
-            // seconds each) to remotes we haven't heard from in a while.  This
-            // runs from the fppd main loop, which is the same thread that drains
-            // the MultiSync control socket (ProcessControlPacket).  Doing the
-            // probes inline stalls sync-packet processing for the duration of the
-            // timeouts, which on a remote shows up as the output freezing for a
-            // second or two and then jumping to catch up.  Run them on a
-            // short-lived detached thread instead; UpdateSystem() takes
-            // m_systemsLock so it is safe to touch the systems list from here.
-            bool expected = false;
-            if (m_httpPingInProgress.compare_exchange_strong(expected, true)) {
-                std::thread([this, addrs = std::move(httpPingAddresses)]() {
-                    SetThreadName("FPP-HTTPPing");
-                    for (auto& address : addrs) {
-                        PingSingleRemoteViaHTTP(address);
-                    }
-                    m_httpPingInProgress = false;
-                }).detach();
+            // HTTP probes of remotes we haven't heard from in a while.  These
+            // used to be blocking curl calls run on a detached thread, because
+            // doing them inline on the fppd main loop -- the same thread that
+            // drains the MultiSync control socket -- stalled sync-packet
+            // processing for the length of the timeouts, which on a remote
+            // showed up as the output freezing for a second or two and then
+            // jumping to catch up.  They now go through CurlManager, so there is
+            // nothing to stall and no thread to keep off the loop.
+            {
+                std::unique_lock<std::mutex> plock(m_httpProbeLock);
+                for (auto& address : httpPingAddresses) {
+                    m_httpPingQueue.push_back(address);
+                }
             }
+            PumpHTTPPings();
         }
     }
     if (superLongGap) {
         Ping(1);
     }
+
+    CheckSystemInfoRefreshes();
 }
 
+// How often a remote's HTTP-fetched detail is refreshed, how soon a failed
+// attempt is retried, and how many fetches may be outstanding at once.  The
+// cap matters on a large show network: without it the first sweep after
+// discovery would open a connection to every remote at the same moment, from a
+// player that may be a single-core BeagleBone.  The rest are simply picked up
+// by a later sweep.
+#define INFO_REFRESH_INTERVAL (30 * 60)
+#define INFO_RETRY_INTERVAL (5 * 60)
+#define INFO_SCAN_INTERVAL 5
+#define INFO_MAX_IN_FLIGHT 4
+
+// Every fetch is delayed by a random slice of a window that grows with the size
+// of the known fleet.  INFO_MAX_IN_FLIGHT bounds what one player sends, but the
+// dangerous direction is the other one: every peer sees the same discover ping,
+// so on a 100-instance show a single fppd restart would otherwise land ~200 HTTP
+// requests on the box that just came up -- the box least able to serve them, and
+// on a BeagleBone that is a real stall.  A whole-show power-on is the same
+// pattern squared, with every box both hammering and being hammered.  Budgeting
+// roughly one second of window per known system holds the aggregate arrival rate
+// at the target near two requests a second no matter how large the show is.
+#define INFO_JITTER_BASE 5
+#define INFO_JITTER_MAX 300
+
+// The multisync page needs a fair amount of slow-changing detail about every
+// remote -- OS version, host description, background color, git branch/commit,
+// whether channel inputs/outputs are enabled, what cape is installed.  It used
+// to fetch all of it from the browser, at least one HTTP request per remote per
+// page load, which is why the table visibly reflowed as the answers trickled
+// in.  fppd already knows every remote and can collect it once per remote per
+// INFO_REFRESH_INTERVAL over the async CurlManager, so the UI gets it in the
+// very first GetSystems() response.
+//
+// Runs on the fppd main loop (from PeriodicPing).  It must stay non-blocking:
+// the same loop feeds the sync output, which is why every fetch goes through
+// CurlManager.
+void MultiSync::CheckSystemInfoRefreshes() {
+    time_t now = time(nullptr);
+    if (now < m_nextInfoScan) {
+        return;
+    }
+    m_nextInfoScan = now + INFO_SCAN_INTERVAL;
+
+    std::vector<std::string> toFetch;
+    {
+        std::unique_lock<std::recursive_mutex> lock(m_systemsLock);
+        // We routinely discover ourselves as a "remote" -- over loopback, and
+        // over any address that isn't one of the interface addresses in
+        // m_localSystems (a global IPv6 address, typically).  Those entries
+        // merge into the local row in the UI, which already has everything
+        // about the box serving the page, so probing them is pure waste.
+        std::set<std::string> localUUIDs;
+        for (auto& sys : m_localSystems) {
+            if (!sys.uuid.empty() && sys.uuid != "Unknown") {
+                localUUIDs.insert(sys.uuid);
+            }
+        }
+        for (size_t idx = 0; idx < m_remoteSystems.size(); ++idx) {
+            MultiSyncSystem& sys = m_remoteSystems[idx];
+            // Only full FPP instances: these are FPP's own API endpoints, and
+            // anything at or above kSysTypeFalconController is a third-party
+            // controller that would just 404 (or worse, be confused by) them.
+            if (sys.type == kSysTypeUnknown || sys.type >= kSysTypeFalconController) {
+                continue;
+            }
+            if (sys.infoFetchPending) {
+                continue;
+            }
+            if (localUUIDs.find(sys.uuid) != localUUIDs.end()) {
+                continue;
+            }
+            // Link-local addresses are reachable from here but not from a
+            // browser (the IPv6 zone id is specific to this host), which is why
+            // the multisync page drops those rows.  Loopback never reaches this
+            // list at all -- UpdateSystem() rejects it.
+            if (startsWith(sys.address, "169.254.") || startsWith(sys.address, "fe80:")) {
+                continue;
+            }
+            // A device with more than one NIC has one entry per address.  Act
+            // on it once and stamp every sibling entry the same way, otherwise
+            // the next sweep would pick the siblings up separately;
+            // ForEachRemoteMatching() fans the single answer back out to all of
+            // them.
+            std::string uuid = sys.uuid;
+            if (uuid == "Unknown") {
+                uuid.clear();
+            }
+            std::string address = sys.address;
+            auto stampSiblings = [&](const std::function<void(MultiSyncSystem&)>& apply) {
+                for (auto& other : m_remoteSystems) {
+                    if (other.address == address || (!uuid.empty() && other.uuid == uuid)) {
+                        apply(other);
+                    }
+                }
+            };
+
+            // infoNextFetch == 0 means due but unscheduled: a remote we have
+            // just discovered, or one InvalidateSystemInfo() marked stale after
+            // its discover ping.  A changed version string means the remote was
+            // upgraded under us, which rewrites most of what we cached -- and on
+            // a fleet upgrade that fires everywhere at once, so it earns the
+            // same treatment.  Either way, pick a jittered time and come back
+            // for it on a later sweep instead of fetching right now.
+            if (sys.infoNextFetch == 0 || sys.infoFetchedVersion != sys.version) {
+                // Entry count, not device count: a multi-NIC box contributes
+                // several, as do non-FPP controllers.  That only ever widens
+                // the window, which is the safe direction.
+                int window = INFO_JITTER_BASE + (int)m_remoteSystems.size();
+                if (window > INFO_JITTER_MAX) {
+                    window = INFO_JITTER_MAX;
+                }
+                time_t when = now + (FPPrand() % window);
+                stampSiblings([&](MultiSyncSystem& other) {
+                    other.infoNextFetch = when;
+                    other.infoFetchedVersion = other.version;
+                });
+                continue;
+            }
+            if (now < sys.infoNextFetch) {
+                continue;
+            }
+            // Cap only what is actually sent.  Scheduling above is free and has
+            // to keep running even while the cap is reached, or a large fleet
+            // would never get its jittered times assigned.  Anything held back
+            // here is simply picked up by the next sweep.
+            if ((int)toFetch.size() + m_infoFetchesInFlight >= INFO_MAX_IN_FLIGHT) {
+                continue;
+            }
+
+            stampSiblings([&](MultiSyncSystem& other) {
+                other.infoFetchPending = true;
+                other.infoFetchedVersion = other.version;
+            });
+            toFetch.push_back(address);
+        }
+    }
+    for (auto& address : toFetch) {
+        FetchSystemInfo(address);
+    }
+}
+
+void MultiSync::InvalidateSystemInfo(const std::string& address) {
+    ForEachRemoteMatching(address, [](MultiSyncSystem& sys) {
+        // Due, but unscheduled: the next sweep gives it a jittered time.  Never
+        // fetch straight from here -- this runs for every peer that heard the
+        // same discover ping, which is exactly the pile-on being avoided.
+        sys.infoNextFetch = 0;
+    });
+}
+
+// One device, one identity.
+//
+// A box with several addresses gets an entry per address, and a real UUID only
+// ever reaches the entry that was actually probed for it -- UpdateSystem()
+// matches on the address.  The others keep whatever they were given, which
+// since MAC-derived identities exist means a stand-in rather than nothing.  Two
+// different identities for one device is worse than none: the UI keys a row on
+// the UUID and draws the device twice, and the statistics count it twice, which
+// defeats the deduplication the identity exists to provide.
+//
+// So once any entry knows a real UUID, every other entry for that device adopts
+// it.  Guarded the way the UI guards its own hostname fallback: a hostname
+// claimed by more than one real UUID is not identifying a device at all -- two
+// controllers left on the default name -- so in that case nothing is touched.
+//
+// This is only about filling in for entries that have no identity of their own.
+// A real UUID is never overwritten by another.
+// Records identities one device reported for OTHER addresses.  Some vendors
+// describe their neighbours but not themselves, so this is the only place those
+// devices' identities ever come from.
+//
+// The hints are kept, not applied once and dropped.  Discovery reaches
+// addresses in whatever order it reaches them, so the neighbour describing a
+// device is very often probed BEFORE that device is found -- applying only to
+// what exists right now would silently lose exactly the identities that arrive
+// early.  UpdateSystem() consults the map for every system it touches, so the
+// two orders behave the same.
+//
+// A hint never creates a system: a name in somebody's peer list is not evidence
+// that a device is on this network, and a system discovery has not found has no
+// business appearing in the list.
+void MultiSync::ApplyPeerUUIDs(const std::map<std::string, std::string>& peerUUIDs) {
+    if (peerUUIDs.empty()) {
+        return;
+    }
+    std::unique_lock<std::recursive_mutex> lock(m_systemsLock);
+    for (const auto& [addr, uuid] : peerUUIDs) {
+        if (!addr.empty() && !uuid.empty()) {
+            m_peerUUIDHints[addr] = uuid;
+        }
+    }
+    for (auto& sys : m_remoteSystems) {
+        ApplyUUIDHint(sys);
+    }
+}
+
+// Precedence matches MultiSyncSystem::update(): a device's own UUID always
+// wins, and a MAC-derived stand-in may only replace another stand-in.
+//
+// That a hint OVERRIDES an ARP-derived stand-in is deliberate, and it matters:
+// the two are not the same value.  An ESP32 running on Ethernet uses base+3 as
+// its interface address, so ARP sees a MAC three higher than the one the device
+// reports for itself (measured on WLED and on two Baldricks; Genius, which
+// reports its interface address rather than the base, matches ARP exactly).
+// Both are stable identities for the device -- but they are DIFFERENT stable
+// identities, and letting a device carry whichever one its observer happened to
+// obtain would split it in two, which is the failure this whole path exists to
+// remove.  So the vendor-reported value wins everywhere it is available, and
+// ARP stays the fallback for devices no detector could identify at all.
+void MultiSync::ApplyUUIDHint(MultiSyncSystem& sys) {
+    if (!sys.uuid.empty() && !startsWith(sys.uuid, MAC_UUID_PREFIX)) {
+        return;
+    }
+    auto it = m_peerUUIDHints.find(sys.address);
+    if (it != m_peerUUIDHints.end() && !it->second.empty()) {
+        sys.uuid = it->second;
+    }
+}
+
+void MultiSync::ReconcileDeviceIdentity(const std::string& hostname, FPPMode fppMode) {
+    if (hostname.empty()) {
+        return;
+    }
+    auto isStandIn = [](const std::string& u) {
+        return u.empty() || startsWith(u, MAC_UUID_PREFIX);
+    };
+
+    std::string real;
+    for (auto& sys : m_remoteSystems) {
+        if (sys.hostname != hostname || sys.fppMode != fppMode || isStandIn(sys.uuid)) {
+            continue;
+        }
+        if (real.empty()) {
+            real = sys.uuid;
+        } else if (real != sys.uuid) {
+            return; // hostname shared by more than one device
+        }
+    }
+    if (real.empty()) {
+        return;
+    }
+    for (auto& sys : m_remoteSystems) {
+        if (sys.hostname == hostname && sys.fppMode == fppMode && isStandIn(sys.uuid)) {
+            sys.uuid = real;
+        }
+    }
+}
+
+void MultiSync::ForEachRemoteMatching(const std::string& address,
+                                      const std::function<void(MultiSyncSystem&)>& apply) {
+    std::unique_lock<std::recursive_mutex> lock(m_systemsLock);
+    std::string uuid;
+    for (auto& sys : m_remoteSystems) {
+        if (sys.address == address) {
+            uuid = sys.uuid;
+            break;
+        }
+    }
+    if (uuid == "Unknown") {
+        uuid.clear();
+    }
+    for (auto& sys : m_remoteSystems) {
+        if (sys.address == address || (!uuid.empty() && sys.uuid == uuid)) {
+            apply(sys);
+        }
+    }
+}
+
+void MultiSync::FetchSystemInfo(const std::string& address) {
+    std::string url = buildHttpURL(address, "/api/system/info");
+    ++m_infoFetchesInFlight;
+    // `address` is captured by value on purpose: m_remoteSystems is a vector of
+    // values that UpdateSystem() push_back()s into, so any pointer or reference
+    // to an entry can be dangling by the time this callback runs.  Everything
+    // below re-finds the entries by address instead.
+    CurlManager::INSTANCE.addGet(url, [this, address](int rc, const std::string& resp) {
+        --m_infoFetchesInFlight;
+        Json::Value v;
+        if (rc != 200 || !LoadJsonFromString(resp, v, JsonRoot::Object)) {
+            LogDebug(VB_SYNC, "Could not fetch system info from %s (rc: %d)\n", address.c_str(), rc);
+            time_t retryAt = time(nullptr) + INFO_RETRY_INTERVAL;
+            ForEachRemoteMatching(address, [retryAt](MultiSyncSystem& sys) {
+                sys.infoFetchPending = false;
+                // A zero here means InvalidateSystemInfo() ran while this fetch
+                // was in flight -- the remote restarted mid-request, so what we
+                // just read may already be wrong.  Leave it zero and let the
+                // sweep schedule a fresh attempt.
+                if (sys.infoNextFetch != 0) {
+                    sys.infoNextFetch = retryAt;
+                }
+            });
+            return;
+        }
+
+        MultiSyncSystemInfo info;
+        info.valid = true;
+        info.platform = v.get("Platform", "").asString();
+        info.variant = v.get("Variant", "").asString();
+        info.subPlatform = v.get("SubPlatform", "").asString();
+        info.osVersion = v.get("OSVersion", "").asString();
+        info.osRelease = v.get("OSRelease", "").asString();
+        info.kernel = v.get("Kernel", "").asString();
+        info.hostDescription = v.get("HostDescription", "").asString();
+        info.backgroundColor = v.get("backgroundColor", "").asString();
+        info.branch = v.get("Branch", "").asString();
+        info.localGitVersion = v.get("LocalGitVersion", "").asString();
+        info.remoteGitVersion = v.get("RemoteGitVersion", "").asString();
+        info.upgradeSource = v.get("UpgradeSource", "").asString();
+        if (JsonHas(v, "channelInputsEnabled")) {
+            info.channelInputsEnabled = v["channelInputsEnabled"].asBool() ? 1 : 0;
+        }
+        if (JsonHas(v, "channelOutputsEnabled")) {
+            info.channelOutputsEnabled = v["channelOutputsEnabled"].asBool() ? 1 : 0;
+        }
+        if (JsonHas(v, "IPs") && v["IPs"].isArray()) {
+            for (const auto& ip : v["IPs"]) {
+                if (ip.isString()) {
+                    info.ips.push_back(ip.asString());
+                }
+            }
+        }
+
+        ForEachRemoteMatching(address, [&info](MultiSyncSystem& sys) {
+            sys.systemInfo = info;
+        });
+
+        // Chain the cape fetch rather than issuing both at once: it reuses the
+        // connection just established and halves the peak request count.
+        // infoFetchPending stays set until it finishes so the sweep above does
+        // not re-queue this remote in between.
+        FetchCapeInfo(address);
+    });
+}
+
+void MultiSync::FetchCapeInfo(const std::string& address) {
+    std::string url = buildHttpURL(address, "/api/cape");
+    ++m_infoFetchesInFlight;
+    CurlManager::INSTANCE.addGet(url, [this, address](int rc, const std::string& resp) {
+        --m_infoFetchesInFlight;
+        MultiSyncCapeInfo cape;
+        Json::Value v;
+        if (rc == 200 && LoadJsonFromString(resp, v, JsonRoot::Object)) {
+            cape = MultiSyncCapeInfo::fromCapeJSON(v);
+        } else if (rc == 404) {
+            // GetCapeInfo() answers 404 with {"id": "No Cape!"} when nothing is
+            // installed.  Cache that: it is an answer, not a failure.  (An FPP
+            // old enough to predate the route would 404 the same way and be
+            // recorded as having no cape, which is what the UI shows for it
+            // anyway.)
+            cape.valid = true;
+            cape.present = false;
+        } else {
+            // Anything else (connection failure, or an FPP old enough not to
+            // have /api/cape at all) leaves capeInfo unset and untrusted.
+            LogDebug(VB_SYNC, "Could not fetch cape info from %s (rc: %d)\n", address.c_str(), rc);
+        }
+
+        // End of the chain, so this is where the next refresh is scheduled --
+        // the system info the caller already stored is good either way, so a
+        // cape that could not be read doesn't earn the shorter retry interval.
+        time_t nextAt = time(nullptr) + INFO_REFRESH_INTERVAL;
+        ForEachRemoteMatching(address, [&cape, nextAt](MultiSyncSystem& sys) {
+            if (cape.valid) {
+                sys.capeInfo = cape;
+            }
+            sys.infoFetchPending = false;
+            // Zero means the remote sent a discover ping while this fetch was
+            // in flight, i.e. it restarted mid-request and what we just stored
+            // may already be stale.  Don't paper over that with a 30 minute
+            // interval; leave it due so the sweep reschedules.
+            if (sys.infoNextFetch != 0) {
+                sys.infoNextFetch = nextAt;
+            }
+        });
+    });
+}
+
+// How many HTTP probes of unresponsive remotes may be outstanding at once.
+// Small on purpose: these run against boxes that are quite possibly down, so
+// most of them sit there burning the connect timeout, and the player doing the
+// probing may be a single-core BeagleBone.
+#define HTTP_PING_MAX_IN_FLIGHT 4
+
+// Starts queued probes until the cap is reached or the queue runs dry.  Called
+// from PeriodicPing() on the main loop and again from each completion, which may
+// be on another thread -- see m_httpProbeLock.
+void MultiSync::PumpHTTPPings() {
+    while (true) {
+        std::string address;
+        {
+            std::unique_lock<std::mutex> lock(m_httpProbeLock);
+            if (m_httpPingQueue.empty() || m_httpPingsInFlight >= HTTP_PING_MAX_IN_FLIGHT) {
+                return;
+            }
+            address = m_httpPingQueue.front();
+            m_httpPingQueue.pop_front();
+            // Claimed here, under the same lock as the cap test, so a second
+            // pumper cannot read a stale count and overshoot.
+            ++m_httpPingsInFlight;
+        }
+        StartHTTPPing(address);
+    }
+}
+
+// Probe one address now, outside the queue.  MDNSManager calls this the moment
+// it resolves a host, and that probe must not be deferred behind a sweep -- but
+// it still has to be counted, or the cap above is measured against a number that
+// does not describe reality.  (It is the entry point every caller outside this
+// file uses, which is why the accounting lives here rather than in the pump.)
 void MultiSync::PingSingleRemoteViaHTTP(const std::string& address) {
-    std::string url = buildHttpURL(address);
-    std::string resp;
+    {
+        std::unique_lock<std::mutex> lock(m_httpProbeLock);
+        ++m_httpPingsInFlight;
+    }
+    StartHTTPPing(address);
+}
 
-    if (urlHelper("GET", url, resp, 1)) {
-        if (resp != "") {
-            NetworkController* nc = NetworkController::DetectControllerViaHTML(address.c_str(), resp);
-
+// Asks whatever is at `address` for its front page and hands the answer to the
+// controller detectors.  Both halves are asynchronous, so this returns as soon
+// as the request is queued.  The caller must already have claimed an in-flight
+// slot; whichever path below finishes the probe releases it.
+void MultiSync::StartHTTPPing(const std::string& address) {
+    CurlManager::INSTANCE.addGet(buildHttpURL(address), [this, address](int rc, const std::string& resp) {
+        // rc == 0 is a transfer that never got an HTTP response at all; any
+        // status code means something answered, and the old blocking probe
+        // likewise fed a non-200 body to the detectors rather than dropping it.
+        if (rc == 0 || resp.empty()) {
+            FinishHTTPPing();
+            return;
+        }
+        NetworkController::DetectControllerViaHTML(address, resp, [this, address](NetworkController* nc) {
             if (nc) {
                 UpdateSystem(nc->typeId, nc->majorVersion, nc->minorVersion,
                              nc->systemMode, nc->ip, nc->hostname, nc->version,
                              nc->typeStr, nc->ranges, nc->uuid, false, nc->sendingMultiSync);
+                ApplyPeerUUIDs(nc->peerUUIDs);
                 delete nc;
             } else {
                 UpdateSystem(kSysTypeUnknown, 0, 0, UNKNOWN_MODE, address,
                              address, "Unknown", "Unknown", "0-0", "Unknown", false, false);
             }
-        }
+            FinishHTTPPing();
+        });
+    });
+}
+
+// Releases the in-flight slot and starts whatever is next.  Kept separate
+// because the probe can end at either of two points above.
+void MultiSync::FinishHTTPPing() {
+    {
+        std::unique_lock<std::mutex> lock(m_httpProbeLock);
+        --m_httpPingsInFlight;
     }
+    PumpHTTPPings();
 }
 
 void MultiSync::PingSingleRemote(const char* address, int discover) {
@@ -2182,20 +2666,16 @@ void MultiSync::ReloadSyncDestinations() {
         bool isHostname = std::find_if(s.begin(), s.end(), [](char c) { return (isalpha(c) || (c == ' ')); }) != s.end();
         bool valid = true;
         if (isHostname) {
-            // Use the reentrant getaddrinfo() rather than gethostbyname(), which
-            // shares a single static hostent across the process.
-            struct addrinfo hints{};
-            hints.ai_family = AF_INET;
-            hints.ai_socktype = SOCK_DGRAM;
-            struct addrinfo* res = nullptr;
-            if (getaddrinfo(s.c_str(), nullptr, &hints, &res) != 0 || res == nullptr) {
+            // Reentrant and cached, unlike gethostbyname(), which shares a
+            // single static hostent across the process.
+            uint32_t resolved = 0;
+            if (!ResolveHostToIPv4(s, resolved)) {
                 LogErr(VB_SYNC,
                        "Error looking up Remote hostname: %s\n",
                        s.c_str());
                 valid = false;
             } else {
-                newRemote.sin_addr = ((struct sockaddr_in*)res->ai_addr)->sin_addr;
-                freeaddrinfo(res);
+                newRemote.sin_addr.s_addr = resolved;
             }
         } else {
             newRemote.sin_addr.s_addr = inet_addr(s.c_str());
@@ -3326,6 +3806,23 @@ void MultiSync::ProcessPingPacket(ControlPkt* pkt, int len, const std::string& s
                                 systemMode, address, hostname, version,
                                 typeStr, ranges, localUUID.c_str(), true,
                                 systemMode & 0x04 ? true : false);
+
+        // A discover ping is what an instance sends as its fppd starts (fppd.cpp
+        // calls Discover() during startup), and a restart is exactly when most
+        // of what we cache about a peer changes -- channel inputs/outputs, host
+        // description, background color, anything else that needed a restart to
+        // take effect.  Clearing the fetch timestamp makes the next sweep re-ask
+        // within INFO_SCAN_INTERVAL instead of serving up to
+        // INFO_REFRESH_INTERVAL of stale detail.  The cached values themselves
+        // are left in place so the UI doesn't blank out mid-refetch.
+        //
+        // This cannot amplify into a fetch storm: a discover ping is only ever
+        // answered with plain (non-discover) pings, so one restart invalidates
+        // one system on each peer.  xLights' discovery ping is also a discover
+        // ping, but it carries no address and so never reaches this branch.
+        if (discover && !isLocal) {
+            multiSync->InvalidateSystemInfo(address);
+        }
     }
     if (discover) {
         if ((hostname != m_hostname) && !isLocal) {

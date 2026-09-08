@@ -18,6 +18,8 @@
 #include "Warnings.h" // WarningHolder -- needed directly for NOPCH builds
 
 #include "OpusRTPManager.h"
+#include "GStreamerOut.h"
+#include "PipeWireGraphConfig.h"
 
 #ifdef HAS_OPUS_RTP_GSTREAMER
 
@@ -79,9 +81,10 @@ bool OpusRTPManager::Init() {
         return true;
     }
 
-    if (!gst_is_initialized()) {
-        gst_init(nullptr, nullptr);
-    }
+    // Shared with the playback path and the video managers so gst_init()
+    // happens exactly once, under one lock, whichever subsystem gets here
+    // first.
+    GStreamerOutput::EnsureGStreamerInit();
 
     // Set PipeWire env vars
     setenv("PIPEWIRE_RUNTIME_DIR", "/run/pipewire-fpp", 0);
@@ -100,6 +103,22 @@ void OpusRTPManager::Shutdown() {
 
     LogInfo(VB_MEDIAOUT, "OpusRTPManager: Shutting down\n");
 
+    // Clear this first so a rebuild thread that is mid-sleep sees
+    // shutdown-in-progress and skips calling ApplyConfig() instead of
+    // rebuilding everything we are about to tear down.
+    m_initialized.store(false);
+
+    // Join the rebuild thread BEFORE taking m_applyMutex: that thread calls
+    // ApplyConfig(), which itself takes the lock -- holding it across the
+    // join would deadlock.
+    if (m_rebuildThread.joinable()) {
+        m_rebuildThread.join();
+    }
+
+    // Only now take the apply lock -- it blocks until any in-flight
+    // ApplyConfig() (e.g. from a command thread) has finished.
+    std::lock_guard<std::mutex> applyLock(m_applyMutex);
+
     m_watchdogRunning.store(false);
     if (m_watchdogThread.joinable()) {
         m_watchdogThread.join();
@@ -108,13 +127,17 @@ void OpusRTPManager::Shutdown() {
     StopAllPipelines();
 
     m_active.store(false);
-    m_initialized.store(false);
     LogInfo(VB_MEDIAOUT, "OpusRTPManager: Shutdown complete\n");
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Config loading
 // ──────────────────────────────────────────────────────────────────────────────
+OpusRTPConfig OpusRTPManager::GetConfigSnapshot() {
+    std::lock_guard<std::mutex> lock(m_configMutex);
+    return m_config;
+}
+
 bool OpusRTPManager::LoadConfig() {
     Json::Value root;
     if (!LoadJsonFromFile(m_configPath, root, JsonRoot::Object)) {
@@ -123,7 +146,13 @@ bool OpusRTPManager::LoadConfig() {
         return false;
     }
 
-    m_config.instances.clear();
+    // Parse into a local config and publish it in one locked swap at the end.
+    // Filling m_config in place would let a status query on another thread
+    // iterate the vector while push_back() reallocates it.
+    OpusRTPConfig cfg;
+    static const OpusRTPConfig kDefault;
+    cfg.requireGroupSource =
+        root.get("requireGroupSource", kDefault.requireGroupSource).asBool();
 
     if (root.isMember("instances") && root["instances"].isArray()) {
         for (const auto& instJson : root["instances"]) {
@@ -146,12 +175,17 @@ bool OpusRTPManager::LoadConfig() {
                 inst.bitrate = OpusRTP::DEFAULT_BITRATE;
             }
 
-            m_config.instances.push_back(inst);
+            cfg.instances.push_back(inst);
         }
     }
 
     LogInfo(VB_MEDIAOUT, "OpusRTPManager: Loaded config with %d instances\n",
-            (int)m_config.instances.size());
+            (int)cfg.instances.size());
+
+    {
+        std::lock_guard<std::mutex> lock(m_configMutex);
+        m_config = std::move(cfg);
+    }
     return true;
 }
 
@@ -159,6 +193,12 @@ bool OpusRTPManager::LoadConfig() {
 // ApplyConfig
 // ──────────────────────────────────────────────────────────────────────────────
 bool OpusRTPManager::ApplyConfig() {
+    // Serialize against concurrent ApplyConfig()/Shutdown()/Cleanup() calls -
+    // see m_applyMutex.  Without this, two callers can both get past the
+    // watchdog join below and both reach the std::thread assignment at the
+    // end, where assigning over a joinable thread calls std::terminate().
+    std::lock_guard<std::mutex> applyLock(m_applyMutex);
+
     if (!m_initialized.load()) {
         if (!Init()) {
             return false;
@@ -208,6 +248,11 @@ bool OpusRTPManager::ApplyConfig() {
     }
 
     // Create pipelines for each enabled instance
+    //
+    // Senders held idle because nothing feeds them -- published to
+    // m_deferredSenders below, once the whole pass has run.
+    std::map<int, std::string> deferred;
+
     for (const auto& inst : m_config.instances) {
         if (!inst.enabled) continue;
 
@@ -215,12 +260,31 @@ bool OpusRTPManager::ApplyConfig() {
         bool wantRecv = (inst.mode == "receive" || inst.mode == "both");
 
         if (wantSend) {
-            CreateSendPipeline(inst);
+            // Nothing feeds this sender, so starting it would cost 30 seconds
+            // of blocked apply and end in FAILURE.  Hold it instead -- see
+            // OpusRTPConfig::requireGroupSource.
+            const std::string nodeName = SafeNodeName(inst.name) + "_send";
+            if (m_config.requireGroupSource && !PipeWireGraphFeedsNode(nodeName)) {
+                LogInfo(VB_MEDIAOUT,
+                        "Opus RTP send [%d] '%s': nothing in the audio graph feeds %s, "
+                        "holding the stream idle. Add it to an Audio Output Group "
+                        "and apply that config to start it.\n",
+                        inst.id, inst.name.c_str(), nodeName.c_str());
+                deferred[inst.id] =
+                    "Waiting for audio — not a member of any enabled Audio Output Group";
+            } else {
+                CreateSendPipeline(inst);
+            }
         }
 
         if (wantRecv) {
             CreateRecvPipeline(inst);
         }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(m_pipelineMutex);
+        m_deferredSenders = std::move(deferred);
     }
 
     // Start watchdog thread
@@ -235,6 +299,8 @@ bool OpusRTPManager::ApplyConfig() {
 
 void OpusRTPManager::Cleanup() {
     LogInfo(VB_MEDIAOUT, "OpusRTPManager: Cleanup\n");
+
+    std::lock_guard<std::mutex> applyLock(m_applyMutex);
 
     m_watchdogRunning.store(false);
     if (m_watchdogThread.joinable()) {
@@ -310,15 +376,29 @@ bool OpusRTPManager::CreateSendPipeline(const OpusRTPInstance& inst) {
 
     // Pipeline:
     //   pipewiresrc stream-properties="props,node.name=<node>,node.autoconnect=false"
-    //   ! audioconvert
+    //   ! queue ! audioconvert ! audioresample ! audioconvert ! audiorate
     //   ! audio/x-raw,rate=48000,channels=N
     //   ! opusenc bitrate=<bps> dtx=<bool> inband-fec=<bool> packet-loss-percentage=<int>
     //   ! rtpopuspay pt=96
-    //   ! udpsink host=<ip> port=<port> [multicast options]
+    //   ! udpsink host=<ip> port=<port> qos-dscp=34 [multicast options]
+    //
+    // The resampler is not optional, and audiorate is not a substitute for it:
+    // audiorate only inserts/drops samples to patch timestamp gaps, it cannot
+    // change the rate ("audiorate0 can't handle caps rate=48000").  Opus needs
+    // 48 kHz, and the PipeWire graph does not necessarily run there -- it
+    // follows the output card and sits at 44100 by default -- so without a
+    // resampler this chain has nothing in it that can bridge the two.  See the
+    // matching note in AES67Manager::CreateSendPipeline(): the failure mode
+    // when the rates do not line up is that negotiation never completes and
+    // set_state() blocks, not a clean error.  The split around audioresample
+    // mirrors what was measured to work there; it costs nothing when the graph
+    // already runs at 48000, where the resampler passes through.
 
     std::ostringstream oss;
     oss << "pipewiresrc name=pwsrc min-buffers=2 do-timestamp=true "
         << "! queue max-size-buffers=0 max-size-bytes=0 max-size-time=200000000 leaky=downstream "
+        << "! audioconvert "
+        << "! audioresample "
         << "! audioconvert "
         << "! audiorate "
         << "! audio/x-raw,rate=" << OpusRTP::AUDIO_RATE
@@ -331,6 +411,7 @@ bool OpusRTPManager::CreateSendPipeline(const OpusRTPInstance& inst) {
         << "! rtpopuspay pt=" << OpusRTP::RTP_PAYLOAD_TYPE << " "
         << "! udpsink name=usink host=" << inst.destIP
         << " port=" << inst.port
+        << " qos-dscp=" << OpusRTP::AUDIO_DSCP
         << " sync=false";
 
     if (multicast) {
@@ -573,6 +654,10 @@ void OpusRTPManager::StopAllPipelines() {
         std::lock_guard<std::mutex> lock(m_pipelineMutex);
         sendCopy.swap(m_sendPipelines);
         recvCopy.swap(m_recvPipelines);
+        // Nothing is configured to be running any more, so no sender is
+        // waiting for a source either.  ApplyConfig() refills this after its
+        // create pass; every other caller is a teardown.
+        m_deferredSenders.clear();
     }
 
     for (auto& [id, p] : sendCopy) {
@@ -676,12 +761,26 @@ void OpusRTPManager::WatchdogLoop() {
             // ApplyConfig() once we've exited.
             LogWarn(VB_MEDIAOUT, "OpusRTPManager: Watchdog detected failed pipelines, scheduling rebuild\n");
             m_watchdogRunning.store(false);
-            std::thread([this]() {
+            // Track this as m_rebuildThread (rather than detaching) so
+            // Shutdown() can join it before tearing anything else down -- a
+            // detached thread could otherwise call ApplyConfig() and
+            // resurrect pipelines after Shutdown() has already run, and a
+            // detached thread racing Shutdown()'s own join of
+            // m_watchdogThread is undefined behavior.
+            if (m_rebuildThread.joinable()) {
+                m_rebuildThread.join();
+            }
+            m_rebuildThread = std::thread([this]() {
                 // Brief delay to let this watchdog thread finish exiting
                 // and become joinable.
                 std::this_thread::sleep_for(std::chrono::milliseconds(500));
+                // If Shutdown() ran while we were sleeping, don't resurrect
+                // pipelines -- just exit quietly.
+                if (!m_initialized.load()) {
+                    return;
+                }
                 ApplyConfig();
-            }).detach();
+            });
             break;
         }
     }
@@ -784,6 +883,11 @@ bool OpusRTPManager::HasActiveSendInstances() {
 OpusRTPManager::Status OpusRTPManager::GetStatus() {
     Status status;
 
+    // Snapshot the config BEFORE taking the pipeline lock and use the copy
+    // from here on -- reading m_config directly would race LoadConfig()
+    // reallocating the instance vector on another thread.  See m_configMutex.
+    OpusRTPConfig config = GetConfigSnapshot();
+
     std::unique_lock<std::mutex> lock(m_pipelineMutex, std::try_to_lock);
     if (lock.owns_lock()) {
         for (const auto& [id, p] : m_sendPipelines) {
@@ -793,7 +897,7 @@ OpusRTPManager::Status OpusRTPManager::GetStatus() {
             ps.running = p.running;
             ps.error = p.errorMessage;
 
-            for (const auto& inst : m_config.instances) {
+            for (const auto& inst : config.instances) {
                 if (inst.id == id) {
                     ps.name = inst.name;
                     break;
@@ -809,7 +913,27 @@ OpusRTPManager::Status OpusRTPManager::GetStatus() {
             ps.running = p.running;
             ps.error = p.errorMessage;
 
-            for (const auto& inst : m_config.instances) {
+            for (const auto& inst : config.instances) {
+                if (inst.id == id) {
+                    ps.name = inst.name;
+                    break;
+                }
+            }
+            status.pipelines.push_back(ps);
+        }
+
+        // Senders deliberately held idle.  Reported alongside the real
+        // pipelines rather than omitted: a stream the user enabled and cannot
+        // see anywhere reads as FPP having lost the config.
+        for (const auto& [id, reason] : m_deferredSenders) {
+            Status::PipelineStatus ps;
+            ps.instanceId = id;
+            ps.mode = "send";
+            ps.running = false;
+            ps.waitingForSource = true;
+            ps.note = reason;
+
+            for (const auto& inst : config.instances) {
                 if (inst.id == id) {
                     ps.name = inst.name;
                     break;
@@ -854,6 +978,15 @@ HttpResponsePtr OpusRTPManager::render_GET(const HttpRequestPtr& req) {
             pj["running"] = p.running;
             if (!p.error.empty()) {
                 pj["error"] = p.error;
+            }
+            // Distinct from "error" on purpose: the UI renders a failure in
+            // red and this as guidance, so collapsing the two would put a
+            // brand new instance back in the alarming state this replaced.
+            if (p.waitingForSource) {
+                pj["waitingForSource"] = true;
+            }
+            if (!p.note.empty()) {
+                pj["note"] = p.note;
             }
             pipelines.append(pj);
         }

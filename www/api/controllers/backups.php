@@ -60,24 +60,23 @@ function ProxyBackupToRemote($remotePath, $method = 'GET')
  * Get available backups from subdir
  *
  * Returns a list of full system backup directories within the given path,
- * excluding directories that exist in the media root.
+ * skipping entries that are FPP media subdirectories rather than backup folders
+ * (i.e. when the scanned path is itself the root of a media tree).
  *
  * @param string $backupDir Absolute path to the directory to scan.
  * @return array List of relative directory paths found under $backupDir.
  */
 function GetAvailableBackupsFromDir($backupDir)
 {
-	global $settings;
-
-	$excludeList = array();
 	$dirs = array();
 
-	foreach (scandir($settings['mediaDirectory']) as $fileName) {
-		if (($fileName != '.') &&
-			($fileName != '..')) {
-			array_push($excludeList, $fileName);
-		}
-	}
+	// The exclude list is a FIXED set of known media subdirectory names, NOT a
+	// scandir() of the live media directory. It used to be the latter, which meant
+	// any stray folder in media/ silently hid the identically named backup folder
+	// on the drive -- and restoring a backup with path '/' copies the drive's whole
+	// root into media/, creating exactly those strays. That made a single restore
+	// permanently hide every backup on the drive. See issue #2856.
+	$excludeList = GetFPPMediaDirNames();
 
 	array_push($dirs, '/');
 
@@ -170,7 +169,11 @@ function GetAvailableBackupsOnDevice()
 	}
 	$dirs = array();
 
-	$dirs = DriveMountHelper($deviceName, 'GetAvailableBackupsFromDir', array('/mnt/tmp/'));
+	// Use a per-device mountpoint so concurrent requests for sda1 and sdb1
+	// do not race on the shared /mnt/tmp (see DriveMountHelper locking).
+	// Validation in DriveMountHelper allows /mnt/tmp_<dev>.
+	$mountPath = '/mnt/tmp_' . $deviceName;
+	$dirs = DriveMountHelper($deviceName, 'GetAvailableBackupsFromDir', array($mountPath . '/'), $mountPath);
 
 	return json($dirs);
 }
@@ -197,6 +200,32 @@ function DriveMountHelper($deviceName, $usercallback_function, $functionArgs = a
 	$fsTypeOutput = $mountCmdOutput = $unmountCmdOutput = array();
 	$unmountCmdResultCode = null;
 
+	// Validate deviceName strictly — only real block devices. Prevents injection like "sda1; rm -rf /".
+	if (!preg_match('/^(sd[a-z][0-9]*|mmcblk[0-9]+p[0-9]+|nvme[0-9]+n[0-9]+p[0-9]+)$/', $deviceName)) {
+		array_push($dirs, "ERROR: Invalid device name");
+		return json($dirs);
+	}
+	// Validate mountPath stays under /mnt — prevents traversal like "/mnt/tmp; rm -rf /".
+	if (!preg_match('#^/mnt(/[A-Za-z0-9._-]+)?$#', $mountPath)) {
+		array_push($dirs, "ERROR: Invalid mount path");
+		return json($dirs);
+	}
+
+	// Prevent concurrent mounts to the same mountpoint from racing.
+	// When multiple USB drives are present the UI fires api/backups/list/sda1
+	// and api/backups/list/sdb1 concurrently; without serialization the second
+	// umount would pull the first mount out from under its scandir, making it
+	// appear as "/" only. A file lock serializes the mount/scan/umount.
+	// Use a per-mountpoint lock so sda1 and sdb1 (now on /mnt/tmp_sda1 etc.)
+	// can run concurrently; requests for the same device remain serialized.
+	$lockFp = null;
+	$lockKey = preg_replace('/[^A-Za-z0-9]/', '_', $mountPath);
+	$lockFile = '/tmp/fpp_backup_mount_' . $lockKey . '.lock';
+	$lockFp = @fopen($lockFile, 'c');
+	if ($lockFp) {
+		flock($lockFp, LOCK_EX);
+	}
+
 	//Run commands so mount is available to entire system
 	if ($globalNameSpace === true) {
 		//Since Apache sandboxes all mount interactions and makes them private to the apache process(s)
@@ -205,24 +234,31 @@ function DriveMountHelper($deviceName, $usercallback_function, $functionArgs = a
 		$nsEnter = ' nsenter -m -t 1 ';
 	}
 
-	// unmount just in case
-	exec($SUDO . $nsEnter . ' umount ' . $mountPath);
+	// unmount just in case — quote mountPath so it cannot be split on space/;.
+	exec($SUDO . $nsEnter . ' umount -- ' . escapeshellarg($mountPath));
 
 	$unusable = CheckIfDeviceIsUsable($deviceName);
 	if ($unusable != '') {
 		array_push($dirs, $unusable);
+		if ($lockFp) {
+			flock($lockFp, LOCK_UN);
+			fclose($lockFp);
+		}
 		return json($dirs);
 	}
 
-	exec($SUDO . $nsEnter . ' mkdir -p ' . $mountPath);
+	exec($SUDO . $nsEnter . ' mkdir -p -- ' . escapeshellarg($mountPath));
 
-	$fsType = exec($SUDO . $nsEnter . ' file -sL /dev/' . $deviceName, $fsTypeOutput, $fsTypeResultCode);
+	$devPath = "/dev/" . $deviceName;
+	$fsType = exec($SUDO . $nsEnter . ' file -sL -- ' . escapeshellarg($devPath), $fsTypeOutput, $fsTypeResultCode);
 
 	$mountCmd = '';
 	$isFatMount = false;
 	// Same mount options used in scripts/copy_settings_to_storage.sh
+	$devArg = escapeshellarg($devPath);
+	$mntArg = escapeshellarg($mountPath);
 	if (preg_match('/BTRFS/', $fsType)) {
-		$mountCmd = "mount -t btrfs -o noatime,nodiratime,compress=zstd,nofail /dev/$deviceName $mountPath";
+		$mountCmd = "mount -t btrfs -o noatime,nodiratime,compress=zstd,nofail -- $devArg $mntArg";
 	} else if ((preg_match('/FAT/', $fsType)) ||
 		(preg_match('/DOS/', $fsType))) {
 		// FAT/exFAT have no on-disk ownership, so it must be set at mount time to
@@ -231,10 +267,10 @@ function DriveMountHelper($deviceName, $usercallback_function, $functionArgs = a
 		// can't write into the mount. See issue #2782.
 		$isFatMount = true;
 		$fppIds = GetFPPUserIds();
-		$mountCmd = "mount -t auto -o noatime,nodiratime,exec,nofail,uid=" . $fppIds['uid'] . ",gid=" . $fppIds['gid'] . " /dev/$deviceName $mountPath";
+		$mountCmd = "mount -t auto -o noatime,nodiratime,exec,nofail,uid=" . (int)$fppIds['uid'] . ",gid=" . (int)$fppIds['gid'] . " -- $devArg $mntArg";
 	} else {
 		// Default to ext4
-		$mountCmd = "mount -t ext4 -o noatime,nodiratime,nofail /dev/$deviceName $mountPath";
+		$mountCmd = "mount -t ext4 -o noatime,nodiratime,nofail -- $devArg $mntArg";
 	}
 
 	exec($SUDO . $nsEnter . ' ' . $mountCmd, $mountCmdOutput, $mountCmdResultCode);
@@ -248,7 +284,7 @@ function DriveMountHelper($deviceName, $usercallback_function, $functionArgs = a
 	// just writes, and a large drive's existing content would make that slow.
 	if (!$isFatMount && $mountCmdResultCode == 0) {
 		$fppIds = GetFPPUserIds();
-		exec($SUDO . $nsEnter . ' chown ' . $fppIds['uid'] . ':' . $fppIds['gid'] . ' ' . $mountPath);
+		exec($SUDO . $nsEnter . ' chown ' . (int)$fppIds['uid'] . ':' . (int)$fppIds['gid'] . ' -- ' . escapeshellarg($mountPath));
 	}
 
 	if (isset($usercallback_function) && !empty($functionArgs)) {
@@ -258,20 +294,28 @@ function DriveMountHelper($deviceName, $usercallback_function, $functionArgs = a
 
 	//Unmount by default before we finish
 	if ($unmountWhenDone === true) {
-		$umountCmd = exec($SUDO . $nsEnter . ' umount -l ' . $mountPath, $unmountCmdOutput, $unmountCmdResultCode);
+		$umountCmd = exec($SUDO . $nsEnter . ' umount -l -- ' . escapeshellarg($mountPath), $unmountCmdOutput, $unmountCmdResultCode);
 	}
 
 	//Return more detail about the what has happened with each command
 	if ($returnResultCodes === true) {
+		if ($lockFp) {
+			flock($lockFp, LOCK_UN);
+			fclose($lockFp);
+		}
 		return (array('dirs' => $dirs,
 			'fsType' => array('fsTypeOutput' => $fsTypeOutput, 'fsTypeResultCode' => $fsTypeResultCode),
 			'mountCmd' => array('mountCmdOutput' => $mountCmdOutput, 'mountCmdResultCode' => $mountCmdResultCode, 'mountCmdResultCodeText' => MountReturnCodeMap($mountCmdResultCode), 'actualMountCmd' => $mountCmd),
 			'unmountCmd' => array('unmountCmdOutput' => $unmountCmdOutput, 'unmountCmdResultCode' => $unmountCmdResultCode),
-			'args' => array('mountPath' => '/mnt/tmp', 'unmountWhenDone' => $unmountWhenDone, 'globalNameSpace' => $globalNameSpace)
+			'args' => array('mountPath' => $mountPath, 'unmountWhenDone' => $unmountWhenDone, 'globalNameSpace' => $globalNameSpace)
 		)
 		);
 	}
 
+	if ($lockFp) {
+		flock($lockFp, LOCK_UN);
+		fclose($lockFp);
+	}
 	return ($dirs);
 }
 
@@ -298,6 +342,9 @@ function MountDevice()
 	$mountLocation = params('MountLocation');
 	//If a mount location was supplied, adjust the drive mount location to latch it
 	if (isset($mountLocation) && !empty($mountLocation)) {
+		if (!preg_match('/^[A-Za-z0-9._-]+$/', $mountLocation)) {
+			return json(array('Status' => 'Error', 'Message' => 'Invalid mount location'));
+		}
 		$drive_mount_location = "/mnt/" . $mountLocation;
 	}
 
@@ -306,6 +353,9 @@ function MountDevice()
 
 	//Make sure we have a valid device name supplied
 	if (isset($deviceName) && ($deviceName !== "no" || $deviceName !== "")) {
+		if (!preg_match('/^(sd[a-z][0-9]*|mmcblk[0-9]+p[0-9]+|nvme[0-9]+n[0-9]+p[0-9]+)$/', $deviceName)) {
+			return json(array('Status' => 'Error', 'Message' => 'Invalid device name'));
+		}
 		//Mount the device at the specified location
 		$mountResult = DriveMountHelper($deviceName, '', array(), $drive_mount_location, false, true, true);
 
@@ -363,7 +413,14 @@ function UnmountDevice()
 	}
 	//If a mount location was supplied, adjust the drive mount location to latch it
 	if (isset($mountLocation) && !empty($mountLocation)) {
+		if (!preg_match('/^[A-Za-z0-9._-]+$/', $mountLocation)) {
+			return json(array('Status' => 'Error', 'Message' => 'Invalid mount location'));
+		}
 		$drive_mount_location = "/mnt/" . $mountLocation;
+	}
+	// Validate deviceName even for unmount — prevents injection via rmdir path confusion
+	if (!preg_match('/^(sd[a-z][0-9]*|mmcblk[0-9]+p[0-9]+|nvme[0-9]+n[0-9]+p[0-9]+)$/', $deviceName)) {
+		return json(array('Status' => 'Error', 'Message' => 'Invalid device name'));
 	}
 
 	$unmountCmdOutput = array();
@@ -372,12 +429,12 @@ function UnmountDevice()
 	//Make sure we have a valid device name supplied
 	if (isset($deviceName) && ($deviceName !== "no" || $deviceName !== "")) {
 		//Unmount device from the root namespace (it will be mounted there)
-		$umountCmd = exec($SUDO . $nsEnter . ' umount -l ' . $drive_mount_location, $unmountCmdOutput, $unmountCmdResultCode);
+		$umountCmd = exec($SUDO . $nsEnter . ' umount -l -- ' . escapeshellarg($drive_mount_location), $unmountCmdOutput, $unmountCmdResultCode);
 		//This could be incorrect as this result codes are for the mount command, but will give us an idea
 		$unmountCmdOutputText = MountReturnCodeMap($unmountCmdResultCode);
 
 		//Remove the folder that is created for the device to be mounted under
-		exec($SUDO . ' rmdir ' . $drive_mount_location);
+		exec($SUDO . ' rmdir -- ' . escapeshellarg($drive_mount_location));
 
 		//Success
 		if ($unmountCmdResultCode == 0) {
@@ -473,10 +530,28 @@ function process_jsonbackup_file_data_helper($json_config_backup_Data, $source_d
 
 	$json_config_backup_filenames_clean = array();
 
+	//The comment and the trigger source are the only fields that live inside the
+	//backup file itself, and a backup can be tens of megabytes.  Read them from
+	//the metadata cache where we can - see GetBackupMetadataCachePath() - and only
+	//open a backup whose size or mtime says the cached entry no longer describes it.
+	$metadata_cache = LoadBackupMetadataCache();
+	$metadata_cache_dirty = false;
+
 	//process each of the backups and read out the backup comment, and work out the date it was created
 	foreach ($json_config_backup_Data as $backup_filename => $backup_data) {
+		//Only actual backup files.  The directory listing also returns anything
+		//else that happens to be in there - a subdirectory (the blob store), a
+		//README somebody dropped in - and the date parsing below cannot survive a
+		//name it does not recognise: createFromFormat() returns false and calling
+		//->format() on it is a fatal that takes out the whole listing, the Backups
+		//page with it, and every settings-change backup (they prune through here).
+		if (!str_ends_with(strtolower($backup_filename), '.json')) {
+			continue;
+		}
+
 		$backup_data_comment = '';
 		$backup_data_trigger_source = null;
+		$backup_blob_refs = array();
 		$backup_alternative = false;
 		$backup_filepath = $source_directory;
 		//Check to see if the source direct is the same as the default or not, if it is't then the the directory is the alternative backup directory (USB or something)
@@ -487,18 +562,56 @@ function process_jsonbackup_file_data_helper($json_config_backup_Data, $source_d
 		//cleanup the filename so it can be used as as a ID
 		$backup_filename_clean = trim(str_replace('.json', '', $backup_filename));
 
-		//Read the backup file so we can extract some metadata
-		$decoded_backup_data = json_decode(file_get_contents($backup_filepath . '/' . $backup_filename), true);
-		if (is_null($decoded_backup_data)) {
-			$decode_error_result = array('Status' => 'Error', 'Message' => 'Unable to decode JSON backup file (' . $backup_filepath . '/' . $backup_filename, 'IsReadable' => is_readable($backup_filepath . '/' . $backup_filename), 'FileContent' => file_get_contents($backup_filepath . '/' . $backup_filename));
-			error_log('process_jsonbackup_file_data_helper: ( ' . json_encode($decode_error_result) . ' )');
-		}
+		$backup_fullpath = $backup_filepath . '/' . $backup_filename;
+		clearstatcache(true, $backup_fullpath);
+		$backup_file_size = @filesize($backup_fullpath);
+		$backup_file_mtime = @filemtime($backup_fullpath);
 
-		if (is_array($decoded_backup_data) && array_key_exists('backup_comment', $decoded_backup_data)) {
-			$backup_data_comment = $decoded_backup_data['backup_comment'];
-		}
-		if (is_array($decoded_backup_data) && array_key_exists('backup_trigger_source', $decoded_backup_data)) {
-			$backup_data_trigger_source = $decoded_backup_data['backup_trigger_source'];
+		if (isset($metadata_cache[$backup_fullpath]) &&
+			$metadata_cache[$backup_fullpath]['size'] === $backup_file_size &&
+			$metadata_cache[$backup_fullpath]['mtime'] === $backup_file_mtime &&
+			isset($metadata_cache[$backup_fullpath]['blob_refs'])) {
+			//Cached: the file has not changed since we last read it
+			$backup_data_comment = $metadata_cache[$backup_fullpath]['backup_comment'];
+			$backup_data_trigger_source = $metadata_cache[$backup_fullpath]['backup_trigger_source'];
+			$backup_blob_refs = $metadata_cache[$backup_fullpath]['blob_refs'];
+		} else {
+			//Read the backup file so we can extract some metadata
+			$raw_backup_data = file_get_contents($backup_fullpath);
+			//Which blobs this backup holds on to, so that pruning can tell which
+			//blobs are still needed without decoding anything.  Read off the
+			//encoded text - see BackupBlobRefsInJson().
+			$backup_blob_refs = array_values(BackupBlobRefsInJson($raw_backup_data));
+
+			$decoded_backup_data = json_decode($raw_backup_data, true);
+			if (is_null($decoded_backup_data)) {
+				$decode_error_result = array('Status' => 'Error', 'Message' => 'Unable to decode JSON backup file (' . $backup_fullpath, 'IsReadable' => is_readable($backup_fullpath), 'FileContent' => $raw_backup_data);
+				error_log('process_jsonbackup_file_data_helper: ( ' . json_encode($decode_error_result) . ' )');
+			}
+			unset($raw_backup_data);
+
+			if (is_array($decoded_backup_data) && array_key_exists('backup_comment', $decoded_backup_data)) {
+				$backup_data_comment = $decoded_backup_data['backup_comment'];
+			}
+			if (is_array($decoded_backup_data) && array_key_exists('backup_trigger_source', $decoded_backup_data)) {
+				$backup_data_trigger_source = $decoded_backup_data['backup_trigger_source'];
+			}
+
+			//Only cache a file we could actually stat and decode - caching the
+			//fallback values for an unreadable file would hide the problem behind
+			//an empty comment on every later listing.
+			if (is_array($decoded_backup_data) && $backup_file_size !== false && $backup_file_mtime !== false) {
+				$metadata_cache[$backup_fullpath] = array(
+					'size' => $backup_file_size,
+					'mtime' => $backup_file_mtime,
+					'backup_comment' => $backup_data_comment,
+					'backup_trigger_source' => $backup_data_trigger_source,
+					'blob_refs' => $backup_blob_refs,
+				);
+				$metadata_cache_dirty = true;
+			}
+
+			unset($decoded_backup_data);
 		}
 
 		//Locate the last underscore, this appears before the date/time in the filename
@@ -515,10 +628,24 @@ function process_jsonbackup_file_data_helper($json_config_backup_Data, $source_d
 			'backup_comment' => $backup_data_comment,
 			'backup_trigger_source' => $backup_data_trigger_source,
 			'backup_time' => $backup_date_time,
-			'backup_time_unix' => $backup_date_time_unix
+			'backup_time_unix' => $backup_date_time_unix,
+			'backup_blob_refs' => $backup_blob_refs
 		);
+	}
 
-		unset($decoded_backup_data);
+	//Drop entries for backups in this directory that have since been deleted, so
+	//the cache cannot grow without bound.  Entries for other directories (the
+	//alternate/USB location) belong to a different pass and are left alone.
+	foreach (array_keys($metadata_cache) as $cached_path) {
+		if (dirname($cached_path) === rtrim($source_directory, '/') &&
+			!isset($json_config_backup_Data[basename($cached_path)])) {
+			unset($metadata_cache[$cached_path]);
+			$metadata_cache_dirty = true;
+		}
+	}
+
+	if ($metadata_cache_dirty) {
+		SaveBackupMetadataCache($metadata_cache);
 	}
 
 	return $json_config_backup_filenames_clean;
@@ -624,7 +751,14 @@ function GetAvailableJSONBackupsOnDevice(){
 	$json_config_backup_filenames = DriveMountHelper($deviceName, 'read_directory_files', array($dir_jsonbackupsalternate, false, true));
 
 	//do some additional massaging of the data
-	$json_config_backup_filenames = array_keys($json_config_backup_filenames);
+	//Backup files only - the directory also holds the blob store subdirectory,
+	//which is not a backup and must not be offered as one.
+	$json_config_backup_filenames = array_values(array_filter(
+		array_keys($json_config_backup_filenames),
+		function ($name) {
+			return str_ends_with(strtolower($name), '.json');
+		}
+	));
 
 	return json($json_config_backup_filenames);
 }
@@ -682,6 +816,7 @@ function RestoreJsonBackup(){
 	$fullPath = "$dir/$restore_from_filename";
 
 	$file_contents_decoded = null;
+	$blob_error = '';
 	$restore_status = array('Success' => 'Failed', 'Message' => '');
 
 	//check that the area supplied is not empty, if so then assume we're restoring all araeas
@@ -701,17 +836,31 @@ function RestoreJsonBackup(){
 			$file_contents = file_get_contents($fullPath);
 
 			if ($file_contents !== FALSE) {
+				//Put back anything stored out of line before decoding - a restore
+				//must see the whole backup.  See InlineBackupBlobs().
+				$blob_error = '';
+				$file_contents = InlineBackupBlobs($file_contents, GetBackupBlobDir($dir), $blob_error);
+			}
+
+			if ($file_contents !== FALSE) {
 				//decode back into an array
 				$file_contents_decoded = json_decode($file_contents, true);
 			} else {
 				//file_get_contents will return false if it couldn't read the file so
 				$restore_status['Success'] = "Ok";
-				$restore_status['Message'] = 'Backup File ' . $fullPath . ' could not be read.';
+				$restore_status['Message'] = 'Backup File ' . $fullPath . ' could not be read.' .
+					(!empty($blob_error) ? ' ' . $blob_error : '');
 			}
 		} else if ((strtolower($restore_from_directory) === 'jsonbackupsalternate')) {
 			if (isset($settings['jsonConfigBackupUSBLocation']) && !empty($settings['jsonConfigBackupUSBLocation']) && strtolower($settings['jsonConfigBackupUSBLocation']) !== 'none') {
 				//Mount and read the json backup from the jsonConfigBackupUSBLocation location
 				$file_contents = DriveMountHelper($settings['jsonConfigBackupUSBLocation'], 'file_get_contents', array($fullPath));
+
+				//As above, rebuild the backup before decoding it
+				$blob_error = '';
+				if ($file_contents !== FALSE) {
+					$file_contents = InlineBackupBlobs($file_contents, GetBackupBlobDir($dir), $blob_error);
+				}
 
 				//If the file was read ok, $file_contents will be false if there was issue reading the file
 				if ($file_contents !== FALSE) {
@@ -720,7 +869,8 @@ function RestoreJsonBackup(){
 				} else {
 					//file_get_contents will return false if it couldn't read the file so
 					$restore_status['Success'] = "Ok";
-					$restore_status['Message'] = 'Backup File ' . $fullPath . ' could not be read.';
+					$restore_status['Message'] = 'Backup File ' . $fullPath . ' could not be read.' .
+						(!empty($blob_error) ? ' ' . $blob_error : '');
 				}
 			}
 		}
@@ -779,15 +929,27 @@ function DownloadJsonBackup(){
 		$fileExists = file_exists($fullPath);
 
 		if ($fileExists) {
+			//What leaves the box has to stand on its own, so put back anything
+			//stored out of line - see InlineBackupBlobs().  A backup with nothing
+			//stored out of line is streamed straight from disk as before.
+			$blob_error = '';
+			$outgoing = InlineBackupBlobs(file_get_contents($fullPath), GetBackupBlobDir($dir), $blob_error);
+
+			if ($outgoing === false) {
+				error_log("DownloadJsonBackup: cannot rebuild '$fullPath' - $blob_error");
+				return json(array("Status" => "Unable to rebuild backup: " . $blob_error, "file" => $fileName, "dir" => $dirName));
+			}
+
 			//Content type will always be json so see the header
 			header("Content-Type: application/json");
 			header("Content-Disposition: attachment; filename=\"" . basename($fileName) . "\"");
+			header("Content-Length: " . strlen($outgoing));
 
 			//Empty the output buffers
 			ob_clean();
 			flush();
 
-			readfile($fullPath);
+			echo $outgoing;
 		} else {
 			$status = "File Not Found";
 			return json(array("Status" => $status, "file" => $fileName, "dir" => $dirName));
@@ -800,15 +962,30 @@ function DownloadJsonBackup(){
 		}
 
 		if ($fileExists) {
+			//As above - the copy on the device carries its own blobs alongside it,
+			//because copying backups there is an rsync of the whole directory.
+			$blob_error = '';
+			$raw = DriveMountHelper($settings['jsonConfigBackupUSBLocation'], 'file_get_contents', array($fullPath));
+			$outgoing = ($raw === false) ? false : InlineBackupBlobs($raw, GetBackupBlobDir($dir), $blob_error);
+			if ($raw === false) {
+				$blob_error = 'the file could not be read from the device';
+			}
+
+			if ($outgoing === false) {
+				error_log("DownloadJsonBackup: cannot rebuild '$fullPath' - $blob_error");
+				return json(array("Status" => "Unable to rebuild backup: " . $blob_error, "file" => $fileName, "dir" => $dirName));
+			}
+
 			//Content type will always be json so see the header
 			header("Content-Type: application/json");
 			header("Content-Disposition: attachment; filename=\"" . basename($fileName) . "\"");
+			header("Content-Length: " . strlen($outgoing));
 
 			//Empty the output buffers
 			ob_clean();
 			flush();
 
-			DriveMountHelper($settings['jsonConfigBackupUSBLocation'], 'readfile', array($fullPath));
+			echo $outgoing;
 		} else {
 			$status = "File Not Found";
 			return json(array("Status" => $status, "file" => $fileName, "dir" => $dirName));

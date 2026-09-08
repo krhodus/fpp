@@ -106,11 +106,17 @@
         }
 
         .status-running {
-            background: #28a745;
+            background: var(--bs-success);
         }
 
         .status-stopped {
-            background: #dc3545;
+            background: var(--bs-danger);
+        }
+
+        /* A stream held idle until an Audio Output Group feeds it is doing
+           what it was configured to do, so it is not red. */
+        .status-idle {
+            background: var(--bs-warning);
         }
 
         .instance-settings .icon-help {
@@ -165,20 +171,24 @@
                             Unlike AES67 (uncompressed, wired-only), Opus is loss-tolerant and bandwidth-efficient.
                             <ul style="margin:0.5rem 0 0 0; padding-left:1.2rem;">
                                 <li><b>WiFi:</b> Use <b>unicast</b> (the receiver's IP address) for reliable streaming.
-                                    WiFi multicast is unreliable &mdash; most access points send it without retransmission at the lowest data rate.</li>
-                                <li><b>Wired:</b> Both unicast and multicast (239.x.x.x) work well. Multicast allows one sender to reach multiple receivers.</li>
-                                <li><b>Receiver:</b> Set the Destination IP to the <em>receiver's own IP</em> for unicast, or a multicast group address (e.g. 239.69.1.x) that both sender and receiver share.</li>
+                                    WiFi multicast is unreliable &mdash; most access points send it without retransmission
+                                    at the lowest data rate.</li>
+                                <li><b>Wired:</b> Both unicast and multicast (239.x.x.x) work well. Multicast allows one
+                                    sender to reach multiple receivers.</li>
+                                <li><b>Receiver:</b> Set the Destination IP to the <em>receiver's own IP</em> for unicast,
+                                    or a multicast group address (e.g. 239.69.1.x) that both sender and receiver share.</li>
                             </ul>
                         </div>
 
-                        <div
-                            style="display:flex; justify-content:space-between; align-items:center; margin-bottom:1rem; flex-wrap:wrap; gap:0.5rem;">
+                        <div class="d-flex justify-content-between align-items-center mb-3 flex-wrap gap-2">
                             <div>
                                 <span id="pwStatus">
                                     <span class="status-indicator status-stopped"></span>Checking PipeWire...
                                 </span>
+                                &nbsp;&nbsp;
+                                <span id="opusStatus"></span>
                             </div>
-                            <div style="display:flex; gap:0.5rem;">
+                            <div class="d-flex gap-2">
                                 <button class="buttons btn-outline-success" onclick="AddInstance()">
                                     <i class="fas fa-plus"></i> Add Opus RTP Instance
                                 </button>
@@ -229,6 +239,17 @@
         <script>
             var opusData = { instances: [] };
             var availableInterfaces = [];
+            var audioGroups = [];
+            // Distinct from audioGroups.length: a box with no output groups at
+            // all still has to show the "nothing feeds this" notice, and until
+            // the request lands there is nothing to judge membership against.
+            var audioGroupsLoaded = false;
+            // Instance IDs fppd reports as held idle, from the status poll.
+            // The membership check below reads the saved groups JSON, which is
+            // not the same question: a member added to a group but not applied
+            // is in the JSON while the running graph still has no link for it.
+            // fppd reads the generated conf, so this is the authoritative half.
+            var waitingInstanceIds = {};
             var nextInstanceId = 1;
             var hasUnsavedChanges = false;
 
@@ -248,9 +269,11 @@
 
             $(document).ready(function () {
                 CheckPipeWireStatus();
+                setInterval(RefreshOpusRTPStatus, 10000);
                 LoadInterfaces().then(function () {
                     LoadInstances();
                 });
+                LoadAudioGroups();
             });
 
             /////////////////////////////////////////////////////////////////////////////
@@ -269,6 +292,128 @@
                             'PipeWire not responding'
                         );
                     });
+
+                RefreshOpusRTPStatus();
+            }
+
+            /////////////////////////////////////////////////////////////////////////////
+            // Whether the streams are actually running is only knowable from
+            // fppd -- the page used to show PipeWire's state alone, so a
+            // pipeline that failed to start looked identical to a healthy one.
+            // Field names track OpusRTPManager::render_GET().
+            function RefreshOpusRTPStatus() {
+                $.getJSON('api/pipewire/opusrtp/status')
+                    .done(function (data) {
+                        var pipelines = data.pipelines || [];
+                        if (pipelines.length === 0) {
+                            $('#opusStatus').html(data.active
+                                ? '<span class="status-indicator status-stopped"></span>No Opus RTP streams running'
+                                : '');
+                            TrackWaitingInstances([]);
+                            return;
+                        }
+
+                        var running = 0;
+                        var waiting = 0;
+                        var errors = [];
+                        for (var i = 0; i < pipelines.length; i++) {
+                            if (pipelines[i].running)
+                                running++;
+                            else if (pipelines[i].waitingForSource)
+                                waiting++;
+                            if (pipelines[i].error)
+                                errors.push(pipelines[i].name + ': ' + pipelines[i].error);
+                        }
+
+                        // A stream held for want of an Audio Output Group is
+                        // doing what it was told to, so it must not colour the
+                        // indicator red -- it is counted and named separately
+                        // rather than folded into "not running".
+                        var started = pipelines.length - waiting;
+                        var html = '';
+                        if (started > 0) {
+                            html += '<span class="status-indicator ' +
+                                (running === started ? 'status-running' : 'status-stopped') +
+                                '"></span>' + running + ' of ' + started + ' stream' +
+                                (started !== 1 ? 's' : '') + ' running';
+                            if (errors.length > 0)
+                                html += ' <span class="text-danger">(' + EscapeHtml(errors.join('; ')) + ')</span>';
+                        }
+                        if (waiting > 0) {
+                            if (html !== '')
+                                html += ' &nbsp;|&nbsp; ';
+                            html += '<span class="status-indicator status-idle"></span>' +
+                                waiting + ' stream' + (waiting !== 1 ? 's' : '') +
+                                ' idle, waiting for an Audio Output Group';
+                        }
+
+                        $('#opusStatus').html(html);
+                        TrackWaitingInstances(pipelines);
+                    })
+                    .fail(function () {
+                        $('#opusStatus').html(
+                            '<span class="status-indicator status-stopped"></span>Opus RTP status unavailable'
+                        );
+                        // fppd is not answering, so what it last said about a
+                        // held stream is no longer something we know.
+                        TrackWaitingInstances([]);
+                    });
+            }
+
+            /////////////////////////////////////////////////////////////////////////////
+            // A send instance is a PipeWire *sink* that something else has to
+            // feed.  Its pipewiresrc is created with node.autoconnect=false, so
+            // with no Audio Output Group member targeting it nothing ever links
+            // in and the pipeline cannot preroll.  fppd checks the generated
+            // group config before starting a sender and holds it idle when
+            // nothing targets it (PipeWireGraphFeedsNode in
+            // PipeWireGraphConfig.cpp) -- otherwise gst_element_set_state()
+            // blocks for 30 seconds per instance and ends in "audio send stream
+            // failed to start", which is what every Apply used to cost while an
+            // instance was being set up.  Groups reference the instance as
+            // cardId "opusrtp_<id>" (see GetPipeWireAudioCards), so the page can
+            // say the same thing before the user even applies.
+            function LoadAudioGroups() {
+                return $.getJSON('api/pipewire/audio/groups')
+                    .done(function (data) {
+                        audioGroups = (data && data.groups) ? data.groups : [];
+                        audioGroupsLoaded = true;
+                        RenderInstances();
+                    });
+            }
+
+            function InstanceHasAudioSource(inst) {
+                var cardId = 'opusrtp_' + inst.id;
+                for (var g = 0; g < audioGroups.length; g++) {
+                    if (audioGroups[g].enabled === false) continue;
+                    var members = audioGroups[g].members || [];
+                    for (var m = 0; m < members.length; m++) {
+                        if (members[m].cardId === cardId) return true;
+                    }
+                }
+                return false;
+            }
+
+            /////////////////////////////////////////////////////////////////////////////
+            // Re-render only when the held set actually changes.  The status
+            // poll runs every 10s and RenderInstances() rebuilds every card, so
+            // doing it unconditionally would drop focus out of a field the user
+            // is typing in twice a minute.
+            function TrackWaitingInstances(pipelines) {
+                var next = {};
+                for (var i = 0; i < pipelines.length; i++) {
+                    if (pipelines[i].waitingForSource)
+                        next[pipelines[i].instanceId] = pipelines[i].note || '';
+                }
+                var before = Object.keys(waitingInstanceIds).sort().join(',');
+                var after = Object.keys(next).sort().join(',');
+                waitingInstanceIds = next;
+                if (before !== after)
+                    RenderInstances();
+            }
+
+            function InstanceIsHeldIdle(inst) {
+                return Object.prototype.hasOwnProperty.call(waitingInstanceIds, inst.id);
             }
 
             /////////////////////////////////////////////////////////////////////////////
@@ -325,7 +470,7 @@
                         '<i class="fas fa-wifi"></i>' +
                         '<h4>No Opus RTP Instances Configured</h4>' +
                         '<p>Create Opus RTP instances to send and/or receive compressed audio streams over the network.<br>' +
-                        'Ideal for WiFi connections where AES67 (uncompressed) would be unreliable.<br>' +
+                        'Ideal for wireless audio and instances where AES67 is not a valid cost option.<br>' +
                         'Each instance appears as a virtual sound card that can be used in Audio Output Groups.</p>' +
                         '<button class="buttons btn-outline-success" onclick="AddInstance()">' +
                         '<i class="fas fa-plus"></i> Create First Instance</button>' +
@@ -381,6 +526,43 @@
 
                 // Body
                 html += '<div class="instance-body">';
+
+                // Nothing feeds this sender -- see LoadAudioGroups().  Only
+                // meaningful once the groups have actually loaded, and only for
+                // an enabled sender: a disabled or receive-only instance has no
+                // sink to feed.
+                //
+                // This is information, not a warning.  fppd holds such a stream
+                // idle instead of trying to start it (see
+                // OpusRTPConfig::requireGroupSource), so Save & Apply here is
+                // safe and quick -- which it has to be, because an instance
+                // cannot be added to a group until it has been saved.
+                var isSender = (mode === 'send' || mode === 'both');
+                var notInGroup = audioGroupsLoaded && !InstanceHasAudioSource(inst);
+                var heldIdle = InstanceIsHeldIdle(inst);
+                if (inst.enabled && isSender && (notInGroup || heldIdle)) {
+                    html += '<div class="alert alert-info d-flex align-items-start gap-2 mb-3">' +
+                        '<i class="fas fa-info-circle mt-1"></i>' +
+                        '<div><b>Idle &mdash; nothing is routed to this stream yet.</b> ' +
+                        (notInGroup
+                            ? 'It is not a member of any enabled ' +
+                              '<a href="pipewire-audio.php">Audio Output Group</a>, so nothing feeds ' +
+                              '<code>' + nodeName + '_send</code> and FPP holds the stream rather ' +
+                              'than transmitting silence. Saving and applying now is fine &mdash; add ' +
+                              'it as a member of a group and apply the Audio Output Groups config, ' +
+                              'and the stream starts automatically.'
+                            // In a group on paper, but the running graph was
+                            // built before that member existed.  PipeWire only
+                            // reads its config at startup, so the group page
+                            // has to apply before anything feeds this node.
+                            : 'It is a member of an <a href="pipewire-audio.php">Audio Output ' +
+                              'Group</a>, but the running audio graph does not feed ' +
+                              '<code>' + nodeName + '_send</code> yet. Apply the Audio Output ' +
+                              'Groups config to rebuild the graph, and the stream starts.') +
+                        '</div>' +
+                        '</div>';
+                }
+
                 html += '<div class="instance-settings">';
 
                 // Stream Mode
@@ -629,6 +811,6 @@
                 return String(str).replace(/[^a-zA-Z0-9_]/g, '_').toLowerCase();
             }
         </script>
-</body>
+        </body>
 
 </html>

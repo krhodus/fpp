@@ -36,6 +36,44 @@ function GetFPPUserIds()
     return array('uid' => $pwentry['uid'], 'gid' => $pwentry['gid']);
 }
 
+/**
+ * Names of the subdirectories and files that make up an FPP media directory.
+ *
+ * This is deliberately a fixed list rather than a scandir() of the live media
+ * directory: it is used to recognise "this path is a media tree, not a folder of
+ * backups", and that judgement must not change just because a stray folder has
+ * appeared in media/. 'lost+found' is included because a media directory on its
+ * own ext4 partition has one, and it is never a backup.
+ *
+ * @return array Directory/file names, without any leading path.
+ */
+function GetFPPMediaDirNames()
+{
+    return array(
+        'backups',
+        'cache',
+        'config',
+        'crashes',
+        'effects',
+        'events',
+        'exim4',
+        'images',
+        'logs',
+        'lost+found',
+        'music',
+        'playlists',
+        'plugindata',
+        'plugins',
+        'scripts',
+        'sequences',
+        'tmp',
+        'upload',
+        'uploads',
+        'videos',
+        'virtualdisplay_assets',
+    );
+}
+
 function getFileList($dir, $ext)
 {
     $i = array();
@@ -1380,7 +1418,6 @@ function PrintSettingCheckbox($title, $setting, $restart, $reboot, $checkedValue
 function " . $changedFunction . "() {
 	var value = '$uncheckedValue';
 	var checked = 0;
-	$('#$escSetting').parent().parent().addClass('loading');
 	if ($('#$escSetting').is(':checked')) {
 		checked = 1;
 		value = '$checkedValue';
@@ -1400,7 +1437,6 @@ function " . $changedFunction . "() {
 
     echo "
 			$callbackName
-			$('#$escSetting').parent().parent().removeClass('loading');
             if (checked)
                 $('.$escSetting' + 'Child').show();
             else
@@ -3413,6 +3449,29 @@ function network_list_interfaces_array()
     return $interfaces;
 }
 
+/**
+ * True when $interface is backed by real hardware that is plugged in right now.
+ *
+ * A "device" symlink under /sys/class/net exists only for a hardware-backed
+ * interface: virtual devices (dummy, bridge, veth, tun) have none, and an
+ * interface that isn't present has no sysfs directory at all. Deliberately makes
+ * no attempt to separate onboard from USB -- on a Pi 3 / Pi Zero the *built-in*
+ * ethernet is itself a USB device, so a bus test would call the only NIC on the
+ * board removable.
+ *
+ * Used to decide whether an interface's FPP config may be deleted: deleting the
+ * config of a NIC that exists doesn't remove the NIC, it just stops FPP managing
+ * it, leaving it with no address after the next setupNetwork.
+ */
+function network_interface_is_hardware($interface)
+{
+    if (!preg_match('/^[A-Za-z0-9][A-Za-z0-9_.-]{0,14}$/', $interface)) {
+        return false;
+    }
+    $dev = "/sys/class/net/" . $interface . "/device";
+    return is_link($dev) || file_exists($dev);
+}
+
 function network_list_interfaces_obj()
 {
     global $settings;
@@ -3580,12 +3639,179 @@ function gitBaseDirectory()
 function getSystemUUID()
 {
     global $fppDir;
-    if (!file_exists("/tmp/fpp_uuid")) {
+    static $memo = null;
+    if ($memo !== null) {
+        return $memo;
+    }
+    $cacheFile = "/tmp/fpp_uuid";
+    $uuid = file_exists($cacheFile) ? trim(file_get_contents($cacheFile)) : "";
+
+    // Do not trust the cache without checking it.  It is written once per boot,
+    // and an upgrade can replace scripts/get_uuid underneath a cache an older
+    // one wrote -- so a value this version rejects, such as a duplicated or
+    // truncated serial, would otherwise stay live until the next reboot.
+    if (!isValidSystemUUID($uuid)) {
         $output = array();
         exec($fppDir . "/scripts/get_uuid", $output);
-        file_put_contents("/tmp/fpp_uuid", trim($output[0]));
+        $uuid = isset($output[0]) ? trim($output[0]) : "";
+        if (!isValidSystemUUID($uuid)) {
+            // "Unknown" is a placeholder, not an identity, so it is never
+            // cached -- the box has to be able to recover within this boot.
+            $memo = "Unknown";
+            return $memo;
+        }
+        cacheSystemIdentity($cacheFile, $uuid);
     }
-    return file_get_contents("/tmp/fpp_uuid");
+    $memo = $uuid;
+    return $memo;
+}
+
+/**
+ * Best-effort write of an identity cache file under /tmp.
+ *
+ * The write genuinely cannot be relied on.  /tmp is sticky and the kernel runs
+ * with fs.protected_regular set, so whichever user creates one of these files
+ * owns it and NO other user -- root included -- can reopen it for writing.  The
+ * web request path runs as fpp while fppd and the boot scripts run as root, so
+ * which of them got there first decides who can refresh it afterwards.
+ *
+ * The cache is therefore an optimisation only.  Callers must already hold a
+ * correct value before calling this, and must not care whether it succeeds.
+ *
+ * @param string $file cache path
+ * @param string $value validated value to store
+ * @return void
+ */
+function cacheSystemIdentity($file, $value)
+{
+    @file_put_contents($file, $value);
+}
+
+/**
+ * Returns a token naming which method produced the system UUID:
+ * setting, cpuinfo, device-tree, board-eeprom, dmidecode, machine-id,
+ * generated, container, ioreg or none -- plus "unknown", which this function
+ * substitutes when the script cannot be asked (one too old to support the
+ * flag).  "unknown" is deliberately NOT in the accepted set below: it must
+ * never be cached, or a box would keep reporting it after the scripts catch
+ * up.  "container" is a generated UUID from
+ * a containerised install, where every hardware source describes the host and
+ * machine-id comes from the image layer -- worth counting separately.  Lets a consumer weight or exclude by
+ * identity quality without having to reverse-engineer the M<n>- prefix.
+ *
+ * @return string source token
+ */
+function getSystemUUIDSource()
+{
+    global $fppDir;
+    // Every token scripts/get_uuid can emit for --source.  "unknown" is not
+    // one of them on purpose -- see the note above.
+    $valid = array(
+        "setting", "cpuinfo", "device-tree", "board-eeprom", "dmidecode",
+        "machine-id", "generated", "container", "ioreg", "none",
+    );
+    static $memo = null;
+    if ($memo !== null) {
+        return $memo;
+    }
+    $cacheFile = "/tmp/fpp_uuid_source";
+    $source = file_exists($cacheFile) ? trim(file_get_contents($cacheFile)) : "";
+
+    // A get_uuid that predates --source ignores the argument and prints the
+    // UUID, so during an upgrade -- new www files, old scripts, in either order
+    // -- this cache gets an identity written into it instead of a source.  It
+    // then never corrects itself, and the field silently becomes a duplicate of
+    // uuid.  Since the whole point of it is to monitor identity quality after a
+    // rollout, being wrong in exactly that window makes it worthless.  Check
+    // the value against the known set rather than trusting what is on disk.
+    if (!in_array($source, $valid)) {
+        $output = array();
+        exec($fppDir . "/scripts/get_uuid --source", $output);
+        $source = isset($output[0]) ? trim($output[0]) : "";
+        if (!in_array($source, $valid)) {
+            // Deliberately not cached, so the box heals as soon as the scripts
+            // catch up rather than staying wrong until it reboots.
+            $memo = "unknown";
+            return $memo;
+        }
+        cacheSystemIdentity($cacheFile, $source);
+    }
+    $memo = $source;
+    return $memo;
+}
+
+/**
+ * Mirrors the uuid_valid() check in scripts/get_uuid so that identifiers
+ * arriving from remote peers get the same scrutiny as locally derived ones.
+ * A value that fails this must never be stored in an identity field: a
+ * token shared by many unrelated hosts silently merges them into one.
+ *
+ * @param string $uuid candidate identifier, with or without an M<n>- prefix
+ * @return bool true if the value is usable as an identity
+ */
+function isValidSystemUUID($uuid)
+{
+    if (!is_string($uuid)) {
+        return false;
+    }
+    $uuid = trim($uuid);
+
+    // "MAC:" marks an identity MultiSync synthesised from a device's hardware
+    // address because the device reported none of its own.  It is good enough
+    // to key a UI row on, but it is not an identity the device chose and it is
+    // a hardware address, so it must not pass as a real UUID.  Rejecting it
+    // here keeps the statistics collector doing what it did before this
+    // stand-in existed: ask the controller for its real identity, and fall back
+    // to a salted local hash rather than reporting the MAC upstream.
+    if (stripos($uuid, 'MAC:') === 0) {
+        return false;
+    }
+
+    // Strip the method prefix so the denylist compares bare values
+    $bare = preg_replace('/^M[0-9]+-/', '', $uuid);
+
+    if ($bare === '' || preg_match('/\s/', $bare) || strlen($bare) < 6) {
+        return false;
+    }
+    $stripped = strtolower(str_replace(array('-', ':', '_'), '', $bare));
+    if (preg_match('/^0+$/', $stripped) || preg_match('/^f+$/', $stripped)) {
+        return false;
+    }
+    //
+    // Per-family shape check, mirroring uuid_valid() in scripts/get_uuid.
+    // BeagleBoard-family serials are <4-digit date code><board code><sequence>.
+    // A serial truncated by the flashing tool keeps a valid-looking prefix and
+    // loses the tail, which is how a handful of values end up shared by
+    // hundreds of unrelated hosts.  A real sequence is at least four
+    // characters, and exactly five digits in the GPB (PocketBeagle) family.
+    // Peers report these too, so a peer UUID gets the same scrutiny.
+    //
+    if (preg_match('/^[0-9]{4}([A-Z]+)([0-9A-Z]*)$/', strtoupper($bare), $m)) {
+        if (strlen($m[2]) < 4) {
+            return false;
+        }
+        if ($m[1] === 'GPB' && !preg_match('/^[0-9]{5}$/', $m[2])) {
+            return false;
+        }
+    }
+
+    // Already rejected by the shape check above; listed so the specific
+    // values known to be catastrophically shared cannot come back if the
+    // shape rules are ever relaxed.
+    $denylist = array(
+        '1741gpb4', '1741gpb2', '123456789', '1234567890', '0123456789',
+        'serial', 'serialnumber', 'systemserialnumber',
+        'notspecified', 'not', 'specified', 'none', 'null', 'nil',
+        'unknown', 'default', 'defaultstring', 'tobefilledbyoem',
+        'n/a', 'na', 'invalid', 'failed', 'notset',
+    );
+    if (in_array(strtolower($bare), $denylist)) {
+        return false;
+    }
+    if (in_array(str_replace(' ', '', strtolower($uuid)), $denylist)) {
+        return false;
+    }
+    return true;
 }
 
 function GetSystemInfoJsonInternal($simple = false, $network = true)
@@ -3783,6 +4009,526 @@ function read_directory_files($directory, $return_data = true, $sort_by_date = f
 }
 
 /**
+ * Configuration backup blob store.
+ *
+ * A backup is a snapshot of every config file on the box, and on a configured
+ * show a handful of those files dwarf everything else - an xLights model group
+ * export, the virtual display map.  They also change very rarely.  Writing a
+ * backup on every settings change therefore stored the same tens of megabytes
+ * again and again: on the box this was written for, 59 backups held exactly one
+ * distinct version of each of the three big areas, 750MB of byte-identical
+ * duplication in a 1.16GB directory, and every checkbox tick wrote another 13MB
+ * to the SD card.
+ *
+ * So anything big is written once, to a file named after the SHA-256 of its
+ * contents, and the backup carries a reference in its place.  Backups that share
+ * an unchanged area share the one blob.
+ *
+ * The store lives in 'blobs' inside the backups directory rather than beside it,
+ * because copying backups to a USB device is an rsync of that whole directory -
+ * the blobs go along with them, and a backup restored from the device resolves
+ * against the copy sitting next to it.
+ *
+ * A backup that leaves the box is always made whole again first: downloads are
+ * inlined on the way out (see DownloadJsonBackup) so what a user downloads is a
+ * self-contained file that restores anywhere, exactly as it was before.
+ *
+ * @param string $backup_dir Directory holding the backup files.
+ * @return string Blob directory for that backup directory, no trailing slash.
+ */
+function GetBackupBlobDir($backup_dir)
+{
+    return rtrim($backup_dir, '/') . '/blobs';
+}
+
+/**
+ * Sub-trees at or above this many encoded bytes are worth storing out of line.
+ * Well above any ordinary config file (the next largest on the box this was
+ * written for is 25KB) so a normal backup is untouched and still readable as
+ * plain JSON.
+ */
+define('FPP_BACKUP_BLOB_MIN_BYTES', 262144);
+
+/**
+ * True if $value is a blob reference produced by ExtractBackupBlobs().
+ *
+ * Deliberately strict - a single key, and a well-formed hash - so a config file
+ * that happens to contain a '__fppBlob' key cannot be mistaken for one.
+ *
+ * @param mixed $value
+ * @return bool
+ */
+function IsBackupBlobRef($value)
+{
+    return is_array($value)
+        && count($value) === 1
+        && isset($value['__fppBlob']['sha256'])
+        && is_string($value['__fppBlob']['sha256'])
+        && preg_match('/^[0-9a-f]{64}$/', $value['__fppBlob']['sha256']) === 1;
+}
+
+/**
+ * Replaces the large sub-trees of an assembled backup with blob references,
+ * writing each one to the blob store.
+ *
+ * Walks down to file granularity and no further: it recurses through the
+ * containers that group areas and filenames, but not into the contents of a file
+ * (a 160,000 line display map is one blob, not 160,000 of them).  Hence the depth
+ * limit and the element-count limit - a short array is a wrapper, a long one is
+ * data.
+ *
+ * Storing a blob is best effort.  If the store cannot be written the sub-tree is
+ * simply left where it is: a bigger backup is a cost, a backup that references a
+ * blob that was never written is a corrupt one.
+ *
+ * @param mixed $node        Backup data (modified in place through the return value).
+ * @param string $blob_dir   Blob directory, from GetBackupBlobDir().
+ * @param array $written     Collects the hashes this backup references.
+ * @param int $depth         Recursion depth, callers pass 0.
+ * @return mixed The node with large sub-trees replaced by references.
+ */
+function ExtractBackupBlobs($node, $blob_dir, &$written, $depth = 0)
+{
+    if (!is_array($node)) {
+        return $node;
+    }
+
+    //A short array is a container to walk through; a long one is a file's worth
+    //of data and is a blob candidate in its own right.  The depth limit stops the
+    //walk at file granularity: deep enough to reach a single file inside the
+    //misc-configs bundle (area -> 'configs' -> [0] -> filename), so that changing
+    //one small config file there does not give every large one a new hash and
+    //rewrite the lot; not so deep that a file's own contents get split up.
+    if ($depth < 4 && count($node) <= 256) {
+        foreach ($node as $key => $value) {
+            $node[$key] = ExtractBackupBlobs($value, $blob_dir, $written, $depth + 1);
+        }
+
+        return $node;
+    }
+
+    $encoded = json_encode($node);
+    if ($encoded === false || strlen($encoded) < FPP_BACKUP_BLOB_MIN_BYTES) {
+        return $node;
+    }
+
+    $hash = hash('sha256', $encoded);
+    $blob_path = $blob_dir . '/' . $hash . '.json';
+
+    if (!file_exists($blob_path)) {
+        if (!is_dir($blob_dir) && @mkdir($blob_dir, 0775, true) === false) {
+            error_log("ExtractBackupBlobs: cannot create '$blob_dir'; storing this data inline instead.");
+            return $node;
+        }
+
+        //Named after its own contents, so a blob is either absent or complete -
+        //write it somewhere else first and move it into place.
+        if (!WriteFileAtomic($blob_path, $encoded)) {
+            error_log("ExtractBackupBlobs: cannot write '$blob_path'; storing this data inline instead.");
+            return $node;
+        }
+    }
+
+    $written[$hash] = $hash;
+
+    return array('__fppBlob' => array(
+        'sha256' => $hash,
+        'bytes' => strlen($encoded),
+        'note' => 'Large unchanged config stored once in backups/blobs and shared by every backup that contains it. Download this backup through the FPP web UI to get a self-contained copy.',
+    ));
+}
+
+/**
+ * Returns every blob hash referenced by an encoded backup.
+ *
+ * Reads the encoded form rather than a decoded one: this is called while
+ * listing the backups, where decoding each file is the very cost the blob store
+ * exists to avoid.
+ *
+ * @param string $json Encoded backup.
+ * @return array Hashes, values and keys both the hash.
+ */
+function BackupBlobRefsInJson($json)
+{
+    $refs = array();
+
+    if (preg_match_all('/"__fppBlob":\{[^{}]*"sha256":"([0-9a-f]{64})"/', (string) $json, $matches)) {
+        foreach ($matches[1] as $hash) {
+            $refs[$hash] = $hash;
+        }
+    }
+
+    return $refs;
+}
+
+/**
+ * Puts the blobs back, returning a backup that stands on its own.
+ *
+ * Works on the encoded backup rather than a decoded one so that making a 20MB
+ * backup whole does not first cost the ~60MB a decoded copy of it occupies -
+ * php-fpm here is capped at 128MB.  A blob holds exactly the json_encode() of
+ * the sub-tree it replaced, so splicing it back in reproduces, byte for byte,
+ * the file that would have been written with no blob store at all.
+ *
+ * A reference that cannot be resolved fails the whole thing.  Restoring a
+ * backup with a hole in it would write a placeholder over a live config file.
+ *
+ * @param string $json      Encoded backup, possibly containing references.
+ * @param string $blob_dir  Where that backup's blobs live.
+ * @param string $error     Set to a description when this returns false.
+ * @return string|false     The backup with every reference resolved, or false.
+ */
+function InlineBackupBlobs($json, $blob_dir, &$error = '')
+{
+    $json = (string) $json;
+
+    //Overwhelmingly the common case, including every backup written before the
+    //blob store existed and every backup a user uploads.
+    if (strpos($json, '"__fppBlob"') === false) {
+        return $json;
+    }
+
+    $fallback_dir = '';
+    if (function_exists('GetDirSetting')) {
+        $fallback_dir = GetBackupBlobDir(GetDirSetting('JsonBackups'));
+    }
+
+    $failed = '';
+    $resolved = preg_replace_callback(
+        '/\{"__fppBlob":\{[^{}]*"sha256":"([0-9a-f]{64})"[^{}]*\}\}/',
+        function ($m) use ($blob_dir, $fallback_dir, &$failed) {
+            $hash = $m[1];
+
+            foreach (array($blob_dir, $fallback_dir) as $dir) {
+                if ($dir === '') {
+                    continue;
+                }
+
+                $path = $dir . '/' . $hash . '.json';
+                if (!file_exists($path)) {
+                    continue;
+                }
+
+                $blob = @file_get_contents($path);
+                //The name is the hash of the contents, so a damaged blob is
+                //detectable rather than something we splice in regardless.
+                if ($blob !== false && hash('sha256', $blob) === $hash) {
+                    return $blob;
+                }
+
+                $failed = "blob $hash in $dir is damaged";
+                return $m[0];
+            }
+
+            $failed = "blob $hash is missing";
+            return $m[0];
+        },
+        $json
+    );
+
+    if ($resolved === null) {
+        $error = 'failed to scan the backup for blob references';
+        return false;
+    }
+
+    if ($failed !== '') {
+        $error = $failed . '. A backup copied off the box by hand does not bring its blobs with it - ' .
+            'download it through the FPP web UI instead, which writes out a self-contained file.';
+        return false;
+    }
+
+    return $resolved;
+}
+
+/**
+ * Deletes blobs that no backup refers to any more.
+ *
+ * $referenced has to be the complete set for the directory, so this is only
+ * safe to call from somewhere that has just listed every backup in it - see
+ * pruneOrRemoveAgedBackupFiles().  Given an incomplete set it would delete data
+ * that is still in use, so it declines to do anything when handed nothing.
+ *
+ * @param string $backup_dir
+ * @param array $referenced Hashes still in use, as keys.
+ * @return int Number of blobs removed.
+ */
+function CollectUnreferencedBackupBlobs($backup_dir, $referenced)
+{
+    $blob_dir = GetBackupBlobDir($backup_dir);
+    if (!is_dir($blob_dir)) {
+        return 0;
+    }
+
+    $blobs = @scandir($blob_dir);
+    if ($blobs === false) {
+        return 0;
+    }
+
+    $removed = 0;
+    foreach ($blobs as $blob) {
+        if (!preg_match('/^([0-9a-f]{64})\.json$/', $blob, $m)) {
+            continue;
+        }
+
+        if (isset($referenced[$m[1]])) {
+            continue;
+        }
+
+        if (@unlink($blob_dir . '/' . $blob)) {
+            $removed++;
+        }
+    }
+
+    return $removed;
+}
+
+/**
+ * Which backups reference which blobs.
+ *
+ * Answers from the metadata cache wherever its recorded size and mtime still
+ * describe the file on disk, and only opens the ones it does not cover, so in
+ * the steady state this reads the small cache file and nothing else.  It is
+ * still authoritative: an entry that no longer matches is not trusted, it is
+ * re-read.
+ *
+ * @param string $backup_dir Directory holding the backup files.
+ * @return array Blob hash => array of backup filenames that reference it.
+ */
+function GetBackupBlobReferenceMap($backup_dir)
+{
+    $map = array();
+    $cache = LoadBackupMetadataCache();
+    $names = @scandir($backup_dir);
+
+    if ($names === false) {
+        return $map;
+    }
+
+    foreach ($names as $name) {
+        if (!str_ends_with(strtolower($name), '.json')) {
+            continue;
+        }
+
+        $path = $backup_dir . '/' . $name;
+        if (!is_file($path)) {
+            continue;
+        }
+
+        clearstatcache(true, $path);
+        $size = @filesize($path);
+        $mtime = @filemtime($path);
+
+        if (isset($cache[$path]['blob_refs']) &&
+            isset($cache[$path]['size']) && $cache[$path]['size'] === $size &&
+            isset($cache[$path]['mtime']) && $cache[$path]['mtime'] === $mtime) {
+            $refs = $cache[$path]['blob_refs'];
+        } else {
+            $refs = array_values(BackupBlobRefsInJson(@file_get_contents($path)));
+        }
+
+        foreach ($refs as $hash) {
+            $map[$hash][] = $name;
+        }
+    }
+
+    return $map;
+}
+
+/**
+ * Explains why a path must not be deleted, for the blob store's sake.
+ *
+ * A blob is not a file in its own right - it is a piece of config that several
+ * backups share, held once instead of copied into each of them.  Deleting one by
+ * hand does not free anything a user would recognise, and it quietly makes every
+ * backup holding a reference to it unrestorable.  The right way to get rid of a
+ * blob is to delete the backups that use it, after which pruning drops it on its
+ * own (see CollectUnreferencedBackupBlobs).
+ *
+ * A blob nothing references is fair game - pruning would have removed it anyway.
+ *
+ * This lives behind the delete API rather than in a confirmation dialog on the
+ * file manager, so that it holds for anything that can reach the API and not
+ * just for the one page that happens to ask first.
+ *
+ * @param string $full_path Resolved path the caller is about to delete.
+ * @return string Reason to refuse, or '' to allow the delete.
+ */
+function DescribeBackupBlobDeletion($full_path)
+{
+    if (!function_exists('GetDirSetting')) {
+        return '';
+    }
+
+    $backup_dir = @realpath(GetDirSetting('JsonBackups'));
+    if ($backup_dir === false) {
+        return '';
+    }
+
+    $blob_dir = @realpath(GetBackupBlobDir($backup_dir));
+    if ($blob_dir === false) {
+        return '';
+    }
+
+    $full_path = (string) $full_path;
+    $is_blob_dir = ($full_path === $blob_dir);
+    $is_blob_file = (strpos($full_path, $blob_dir . '/') === 0)
+        && preg_match('/^([0-9a-f]{64})\.json$/', basename($full_path), $m) === 1;
+
+    if (!$is_blob_dir && !$is_blob_file) {
+        return '';
+    }
+
+    $references = GetBackupBlobReferenceMap($backup_dir);
+
+    if ($is_blob_file) {
+        $users = isset($references[$m[1]]) ? $references[$m[1]] : array();
+        if (empty($users)) {
+            //Nothing points at it; pruning would have removed it anyway
+            return '';
+        }
+
+        return 'this is not a file of its own - it is configuration that '
+            . DescribeBackupList($users)
+            . ' share a single copy of. Deleting it leaves '
+            . (count($users) == 1 ? 'that backup' : 'those backups')
+            . ' unrestorable. To reclaim the space, delete the backups themselves and this is removed automatically.';
+    }
+
+    //The whole store.  Everything referenced anywhere would go at once.
+    $used_by = array();
+    foreach ($references as $users) {
+        foreach ($users as $user) {
+            $used_by[$user] = true;
+        }
+    }
+
+    if (empty($used_by)) {
+        return '';
+    }
+
+    return 'this folder holds configuration shared by ' . count($used_by)
+        . ' backups rather than files of its own, and emptying it leaves all of them unrestorable.'
+        . ' To reclaim the space, delete the backups themselves and this empties automatically.';
+}
+
+/**
+ * Renders a list of backup filenames for a message, without running to pages.
+ *
+ * @param array $names
+ * @return string
+ */
+function DescribeBackupList($names)
+{
+    $shown = array_slice($names, 0, 3);
+    $rest = count($names) - count($shown);
+
+    return implode(', ', $shown) . ($rest > 0 ? ' and ' . $rest . ' other backup' . ($rest == 1 ? '' : 's') : '');
+}
+
+/**
+ * Backup metadata cache.
+ *
+ * Listing the configuration backups needs exactly two things out of each backup
+ * file - the comment and the trigger source.  Everything else on a listing row
+ * comes from the filename or a stat().  Reading those two fields out of the
+ * files themselves means json_decode()ing every backup on every listing, and a
+ * backup of a configured show is tens of megabytes: with the default of 60 kept
+ * backups that is a gigabyte of JSON parsed to recover a few hundred bytes.
+ *
+ * That cost was not confined to the Backups page.  Every settings change writes
+ * a backup, and writing one prunes the old ones through the same listing, so a
+ * single checkbox on the settings page paid for a full re-read of every backup
+ * on the box - several seconds of it.
+ *
+ * The cache maps a backup's full path to those two fields plus the size and
+ * mtime they were read at, so an unchanged file is never opened twice.  It is
+ * only ever a cache: a miss (or a missing/corrupt cache file) falls back to
+ * reading the backup, so deleting it costs one slow listing and nothing else.
+ *
+ * It lives in media/cache rather than the config directory because anything
+ * ending in .json under config/ is swept into the "misc configs" area of the
+ * backups, and anything in config/backups/ is itself listed as a backup.
+ *
+ * @return string Full path of the cache file.
+ */
+function GetBackupMetadataCachePath()
+{
+    global $settings;
+    return $settings['mediaDirectory'] . '/cache/backupMetadata.json';
+}
+
+/**
+ * Reads the backup metadata cache.
+ *
+ * @return array Map of backup path => array('size', 'mtime', 'backup_comment', 'backup_trigger_source').
+ */
+function LoadBackupMetadataCache()
+{
+    $path = GetBackupMetadataCachePath();
+    if (!file_exists($path)) {
+        return array();
+    }
+
+    $cache = json_decode(@file_get_contents($path), true);
+
+    return is_array($cache) ? $cache : array();
+}
+
+/**
+ * Writes the backup metadata cache.
+ *
+ * Concurrent writers can lose each other's entries here.  That is harmless: a
+ * lost entry is re-read from the backup file on the next listing, and a stale
+ * one is rejected by the size/mtime check before it is ever used.
+ *
+ * @param array $cache
+ * @return bool
+ */
+function SaveBackupMetadataCache($cache)
+{
+    $path = GetBackupMetadataCachePath();
+    $dir = dirname($path);
+
+    if (!is_dir($dir) && @mkdir($dir, 0775, true) === false) {
+        return false;
+    }
+
+    return WriteFileAtomic($path, json_encode($cache));
+}
+
+/**
+ * Builds a cache entry for a backup file that has just been written, so the
+ * next listing never has to open it.  Called by doBackupDownload().
+ *
+ * @param string $backup_file_path Full path of the backup that was written.
+ * @param string $backup_comment
+ * @param string|null $backup_trigger_source
+ * @param array $blob_refs Blob hashes the backup references, as keys.
+ * @return bool
+ */
+function RememberBackupMetadata($backup_file_path, $backup_comment, $backup_trigger_source, $blob_refs = array())
+{
+    clearstatcache(true, $backup_file_path);
+    $size = @filesize($backup_file_path);
+    $mtime = @filemtime($backup_file_path);
+
+    if ($size === false || $mtime === false) {
+        return false;
+    }
+
+    $cache = LoadBackupMetadataCache();
+    $cache[$backup_file_path] = array(
+        'size' => $size,
+        'mtime' => $mtime,
+        'backup_comment' => $backup_comment,
+        'backup_trigger_source' => $backup_trigger_source,
+        'blob_refs' => array_values($blob_refs),
+    );
+
+    return SaveBackupMetadataCache($cache);
+}
+
+/**
  * Makes a POST Call to the api/backups/configuration to generate a JSON Configuration backup with a option comment
  * @param $backup_comment string Optional Comment that will be inserted into the JSON backup file
  * @param $trigger_source string Optional Source that triggered the backup,
@@ -3910,33 +4656,61 @@ function GetAvailableBackupsDevices($all = false)
     $devices = array();
 
     foreach (scandir("/dev/") as $deviceName) {
-        if (preg_match("/^sd[a-z][0-9]/", $deviceName)) {
-            exec($SUDO . " sfdisk -s /dev/$deviceName", $output, $return_val);
-            $GB = round(intval($output[0]) / 1024.0 / 1024.0, 1);
+        if (!preg_match('/^(sd[a-z][0-9]+|mmcblk[0-9]+p[0-9]+|nvme[0-9]+n[0-9]+p[0-9]+)$/', $deviceName)) {
+            continue;
+        }
+        // Use lsblk for size so it works for sd, mmcblk and nvme alike.
+        // sfdisk -s is sd-specific and reports in 1K blocks; lsblk reports bytes.
+        $sizeBytes = trim(shell_exec($SUDO . " lsblk -bno SIZE " . escapeshellarg("/dev/" . $deviceName) . " 2>/dev/null | head -1"));
+        $GB = 0;
+        if ($sizeBytes !== '' && is_numeric($sizeBytes)) {
+            $GB = round(intval($sizeBytes) / 1024.0 / 1024.0 / 1024.0, 1);
+        } else {
+            // Fallback to previous sfdisk method for older kernels/types
+            exec($SUDO . " sfdisk -s " . escapeshellarg("/dev/" . $deviceName), $output, $return_val);
+            if (isset($output[0])) {
+                $GB = round(intval($output[0]) / 1024.0 / 1024.0, 1);
+            }
             unset($output);
+        }
 
-            if ($GB <= 0.1) {
+        if ($GB <= 0.1) {
+            continue;
+        }
+
+        if (!$all) {
+            $unusable = CheckIfDeviceIsUsable($deviceName);
+            if ($unusable != '') {
                 continue;
             }
 
-            if (!$all) {
-                $unusable = CheckIfDeviceIsUsable($deviceName);
-                if ($unusable != '') {
-                    continue;
-                }
-
-            }
-
-            $baseDevice = preg_replace('/[0-9]*$/', '', $deviceName);
-
-            $device = array();
-            $device['name'] = $deviceName;
-            $device['size'] = $GB;
-            $device['model'] = exec("cat /sys/block/$baseDevice/device/model");
-            $device['vendor'] = exec("cat /sys/block/$baseDevice/device/vendor");
-
-            array_push($devices, $device);
         }
+
+        // Derive base block device for model/vendor lookup:
+        // sda1 -> sda, mmcblk0p1 -> mmcblk0, nvme0n1p1 -> nvme0n1
+        $baseDevice = $deviceName;
+        if (preg_match('/^(sd[a-z])[0-9]+$/', $deviceName, $m)) {
+            $baseDevice = $m[1];
+        } elseif (preg_match('/^(mmcblk[0-9]+)p[0-9]+$/', $deviceName, $m)) {
+            $baseDevice = $m[1];
+        } elseif (preg_match('/^(nvme[0-9]+n[0-9]+)p[0-9]+$/', $deviceName, $m)) {
+            $baseDevice = $m[1];
+        }
+
+        $device = array();
+        $device['name'] = $deviceName;
+        $device['size'] = $GB;
+        $device['model'] = exec("cat /sys/block/$baseDevice/device/model 2>/dev/null");
+        if ($device['model'] == '') {
+            // mmcblk and nvme expose model elsewhere; try lsblk as fallback
+            $device['model'] = trim(shell_exec("lsblk -dno MODEL " . escapeshellarg("/dev/" . $baseDevice) . " 2>/dev/null"));
+        }
+        $device['vendor'] = exec("cat /sys/block/$baseDevice/device/vendor 2>/dev/null");
+        if ($device['vendor'] == '') {
+            $device['vendor'] = trim(shell_exec("lsblk -dno VENDOR " . escapeshellarg("/dev/" . $baseDevice) . " 2>/dev/null"));
+        }
+
+        array_push($devices, $device);
     }
 
     return $devices;
@@ -3952,15 +4726,24 @@ function CheckIfDeviceIsUsable($deviceName)
 {
     global $SUDO;
 
-    // Check if in use / Mount / List / Unmount
-    $mountPoint = exec($SUDO . " lsblk /dev/$deviceName");
-    $mountPoint = preg_replace('/.*disk ?/', '', $mountPoint);
-    $mountPoint = preg_replace('/.*part ?/', '', $mountPoint);
-    if (preg_match('/[a-z0-9\/]/', $mountPoint)) {
-        return "ERROR: Partition is mounted on: $mountPoint";
+    // Use lsblk MOUNTPOINTS / findmnt for a reliable, column-aware check.
+    // The old code did `lsblk /dev/X` + regex on TYPE words, which breaks with
+    // multi-device lsblk tree output and with newer MOUNTPOINTS column.
+    $mountPoint = trim(shell_exec($SUDO . " lsblk -nro MOUNTPOINTS " . escapeshellarg("/dev/" . $deviceName) . " 2>/dev/null | head -1"));
+    // lsblk may return multiple mountpoints space-separated for bind mounts; check first entry
+    if ($mountPoint !== '') {
+        $firstMount = preg_split('/\s+/', $mountPoint)[0];
+        if ($firstMount !== '' && $firstMount !== '0') {
+            return "ERROR: Partition is mounted on: $firstMount";
+        }
+    }
+    // Fallback to findmnt if lsblk not available or empty but still mounted
+    $findmnt = trim(shell_exec($SUDO . " findmnt -n -o TARGET -- " . escapeshellarg("/dev/" . $deviceName) . " 2>/dev/null | head -1"));
+    if ($findmnt !== '') {
+        return "ERROR: Partition is mounted on: $findmnt";
     }
 
-    $isSwap = exec("grep /dev/$deviceName /proc/swaps");
+    $isSwap = exec("grep -F " . escapeshellarg("/dev/" . $deviceName) . " /proc/swaps 2>/dev/null");
     if ($isSwap != "") {
         return "ERROR: $deviceName is a swap partition";
     }
@@ -4181,5 +4964,163 @@ function fppUrlHost(string $host): string
     return $host;
 }
 
+/**
+ * Send cache validators for a response, and answer 304 if the client already
+ * has this version.
+ *
+ * Two things make this worth doing in PHP rather than leaving it to Apache.
+ * Apache does apply the conditional itself once a handler has set an ETag or
+ * Last-Modified -- it will turn the response into a 304 on its own -- but by
+ * then PHP has already produced the body it is about to throw away. Returning
+ * early here skips that work. And for a file, the validator can be derived
+ * from a stat() alone, so a repeat request never reads the file at all.
+ *
+ * Matching is on the bare tag appearing anywhere in If-None-Match rather than
+ * on equality: the header may carry a list, and a cache that compressed the
+ * response on the way past can echo the tag back with a "-gzip" suffix.
+ *
+ * @param string $etag  Bare validator, no quotes.
+ * @param int    $mtime Unix mtime for Last-Modified, or 0 to omit it.
+ * @return bool True if a 304 was sent and the caller should stop.
+ */
+function fppSendCacheValidators($etag, $mtime = 0)
+{
+    if (headers_sent()) {
+        return false;
+    }
+
+    header('ETag: "' . $etag . '"');
+    if ($mtime > 0) {
+        header('Last-Modified: ' . gmdate('D, d M Y H:i:s', $mtime) . ' GMT');
+    }
+
+    $inm = isset($_SERVER['HTTP_IF_NONE_MATCH']) ? $_SERVER['HTTP_IF_NONE_MATCH'] : '';
+    if ($inm !== '' && strpos($inm, $etag) !== false) {
+        http_response_code(304);
+        return true;
+    }
+
+    // Only consulted when the client sent no ETag at all. If-None-Match wins
+    // outright per RFC 9110: a client that holds a tag has already been told
+    // above that it does not match, and a second opinion from a timestamp --
+    // which has only one-second resolution -- must not override that.
+    if ($inm === '' && $mtime > 0 && isset($_SERVER['HTTP_IF_MODIFIED_SINCE'])) {
+        $since = strtotime($_SERVER['HTTP_IF_MODIFIED_SINCE']);
+        if ($since !== false && $mtime <= $since) {
+            http_response_code(304);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/**
+ * Validators for a file on disk, derived from a stat() rather than its content.
+ *
+ * size-mtime-inode changes whenever the file does, without reading a byte of
+ * it, so a client that already has the file costs one stat and no I/O.
+ *
+ * Except while the timestamp is still racy. st_mtime has one-second
+ * resolution, so two writes inside the same second produce the same mtime, and
+ * if they also leave the size and inode alone -- an in-place rewrite of the
+ * same number of bytes -- the validator repeats for different content. A
+ * client that read between the two writes then holds a tag that still matches,
+ * and gets a 304 carrying the older file. Worse, it stays wrong: nothing
+ * changes the tag again until some later write alters the size or the mtime.
+ * FPP's own config writers go through WriteFileAtomic(), whose rename() gives
+ * the file a new inode and so happens to avoid this -- but that is a property
+ * of one writer, not of the validator, and anything editing a config in place
+ * (a script, an editor, a plugin, an rsync) reintroduces it.
+ *
+ * So a stat is only trusted once its mtime is safely in the past; inside that
+ * window the content is hashed instead. Once now is more than a second past
+ * the mtime, no later write can land on that same mtime value again -- time
+ * only moves forward -- so a stat-derived tag handed out after the window can
+ * never be reused for different content. The `>=` also covers a clock that
+ * steps backwards, which on these boards happens every boot before NTP
+ * settles: mtime then reads as being in the future, and the conservative path
+ * is the one that gets taken.
+ *
+ * The cost is a read and a hash of a file that was just written, which is
+ * exactly when a page is reloading its config anyway. Beyond a few megabytes
+ * that is no longer worth it, so an oversized file in the racy window is sent
+ * with no validator at all -- always a 200, never a wrong 304.
+ *
+ * @return bool True if a 304 was sent and the caller should stop.
+ */
+function fppSendFileCacheValidators($path)
+{
+    // Callers reach here after their own file_exists()/is_dir() checks, which
+    // populate PHP's per-request stat cache. Read the file's real current
+    // state rather than whatever those left behind.
+    clearstatcache(true, $path);
+
+    $st = @stat($path);
+    if ($st === false) {
+        return false;
+    }
+
+    if ($st['mtime'] >= time() - 1) {
+        if ($st['size'] > 4 * 1024 * 1024) {
+            return false;
+        }
+        $content = @file_get_contents($path);
+        if ($content === false) {
+            return false;
+        }
+
+        return fppSendContentCacheValidators($content);
+    }
+
+    return fppSendCacheValidators(
+        sprintf('%x-%x-%x', $st['size'], $st['mtime'], $st['ino']),
+        $st['mtime']
+    );
+}
+
+/**
+ * Validators for a body PHP has already built. Falls back to hashing the bytes
+ * because there is nothing cheaper to key on; use fppSendFileCacheValidators()
+ * instead wherever the answer is a file.
+ *
+ * @return bool True if a 304 was sent and the caller should stop.
+ */
+function fppSendContentCacheValidators($body)
+{
+    return fppSendCacheValidators(sprintf('%x-%s', strlen($body), substr(md5($body), 0, 16)));
+}
+
+/**
+ * Whether the gpiochip/line numbers behind a header pin are stable enough to show.
+ *
+ * They only mean something on the Pi, where the 40-pin header maps to a fixed set of
+ * SoC lines.  Everywhere else -- the BeagleBone family, and anything behind an i2c
+ * GPIO expander on any platform -- the chip index comes out of an asynchronous
+ * boot-time probe and can differ from one boot to the next, so a number in the UI is
+ * noise the user cannot act on.  Pin-by-pin filtering lives in GPIOPinLabel() and in
+ * fppPinHasGpioNumbers() on the JS side; this is just the platform half.
+ */
+function GPIOPlatformHasStablePinNumbers()
+{
+    global $settings;
+
+    return isset($settings['Platform']) && $settings['Platform'] == "Raspberry Pi";
+}
+
+/**
+ * Label a GPIO header pin for a dropdown, annotated with the chip/line it drives
+ * where that is meaningful (see GPIOPlatformHasStablePinNumbers()) and left as the
+ * bare pin name where it is not.
+ */
+function GPIOPinLabel($pin, $chip, $line)
+{
+    if (!GPIOPlatformHasStablePinNumbers() || !str_starts_with($pin, 'P1-') ||
+        $chip === null || $line === null) {
+        return $pin;
+    }
+
+    return $pin . " (GPIO " . $chip . "/" . $line . ")";
+}
 
 ?>

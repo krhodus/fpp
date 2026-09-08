@@ -2,7 +2,14 @@
 header( "Access-Control-Allow-Origin: *");
 
 $wrapped = 1;
-$version = escapeshellcmd($_GET['version']);
+$rawVersion = $_GET['version'] ?? '';
+// Allow HEAD, version tags, branch names, or SHA — same as gitCheckoutVersion, plus slash for feature branches.
+if ($rawVersion === '' || !preg_match('/^[A-Za-z0-9_.\/-]+$/', $rawVersion) || strpos($rawVersion, '..') !== false || $rawVersion[0] === '-') {
+    http_response_code(400);
+    echo "Invalid version";
+    exit(0);
+}
+$version = $rawVersion;
 
 if (isset($_GET['wrapped']))
     $wrapped = 1;
@@ -21,11 +28,11 @@ if (!$wrapped) {
 <title>
 Upgrading FPP
 </title>
-<script type="text/javascript" src="js/jquery-latest.min.js"></script>
-<script type="text/javascript" src="js/jquery-ui.min.js"></script>
-<script type="text/javascript" src="js/jquery.ui.touch-punch.js"></script>
-<script type="text/javascript" src="js/jquery.jgrowl.min.js"></script>
-<link rel="stylesheet" href="css/jquery.jgrowl.min.css" />
+<script type="text/javascript" src="js/jquery-latest.min.js?ref=<?= filemtime('js/jquery-latest.min.js'); ?>"></script>
+<script type="text/javascript" src="js/jquery-ui.min.js?ref=<?= filemtime('js/jquery-ui.min.js'); ?>"></script>
+<script type="text/javascript" src="js/jquery.ui.touch-punch.js?ref=<?= filemtime('js/jquery.ui.touch-punch.js'); ?>"></script>
+<script type="text/javascript" src="js/jquery.jgrowl.min.js?ref=<?= filemtime('js/jquery.jgrowl.min.js'); ?>"></script>
+<link rel="stylesheet" href="css/jquery.jgrowl.min.css?ref=<?= filemtime('css/jquery.jgrowl.min.css'); ?>" />
 <script>
 function Reboot() {
     $.get({
@@ -51,7 +58,7 @@ function Reboot() {
     echo "FPP Upgrade to version " . $version . "\n";
 }
 
-	$command = $SUDO . " " . $fppDir . "/scripts/upgrade_FPP " . $version . " 2>&1";
+	$command = $SUDO . " " . escapeshellarg($fppDir . "/scripts/upgrade_FPP") . " " . escapeshellarg($version) . " 2>&1";
 
 	echo "Command: $command\n";
 	echo "----------------------------------------------------------------------------------\n";

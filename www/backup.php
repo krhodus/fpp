@@ -267,11 +267,25 @@ if (isset($_POST['btnDownloadConfig'])) {
                 $rstftmp_name = $_FILES['conffile']['tmp_name'];
                 //file contents
                 $file_contents = file_get_contents($rstftmp_name);
-                //decode back into an array
-                $file_contents_decoded = json_decode($file_contents, true);
 
-                //successful decode
-                doRestore($restore_area, $file_contents_decoded, $rstfname, $keepNetworkSettings, $keepMasterSlaveSettings, 'page');
+                //An uploaded backup is normally already whole - downloads are
+                //written out that way.  One copied off the box by hand is not, so
+                //resolve against this box's own blob store; anything still
+                //unresolved is reported rather than restored with a hole in it.
+                $blob_error = '';
+                $file_contents = InlineBackupBlobs($file_contents, GetBackupBlobDir(GetDirSetting('JsonBackups')), $blob_error);
+
+                if ($file_contents === false) {
+                    $backup_error_string = "Restore: the uploaded backup " . $rstfname . " is incomplete - " . $blob_error;
+                    $backup_errors[] = $backup_error_string;
+                    error_log($backup_error_string);
+                } else {
+                    //decode back into an array
+                    $file_contents_decoded = json_decode($file_contents, true);
+
+                    //successful decode
+                    doRestore($restore_area, $file_contents_decoded, $rstfname, $keepNetworkSettings, $keepMasterSlaveSettings, 'page');
+                }
             }
         }
     }
@@ -1278,7 +1292,15 @@ function BackupConfigFolderConfigs()
     foreach ($json_config_files as $filename => $fn_bool) {
         //If the filename has the extension of .json, then we want to keep it, discard all others
         //eg no .htaccess, .htpassword or .db files
-        if (stripos(strtolower($filename), ".json") === false) {
+        //
+        //This tests the extension, not "contains .json anywhere".  A substring
+        //test also matched every sidecar copy sitting beside a config file -
+        //co-other.json.backup, gpio.json.conflict, channeloutputs.json_not_working,
+        //xlights-modelgroups.json.pre-grouptype - so each backup carried a second
+        //copy of config it had already backed up.  On a box with a large xLights
+        //layout that was a third of the whole backup, repeated for every kept
+        //backup.  A copy of a config file is not itself config.
+        if (!str_ends_with(strtolower($filename), ".json")) {
             unset($json_config_files[$filename]);
         }
         //else true so we keep the filename
@@ -1718,7 +1740,7 @@ function doBackupDownload($settings_data, $area)
         if ($protectSensitiveData == false) {
             $backup_fname .= "unprotected_";
         }
-        $backup_fname .= date("YmdHis") . ".json";
+        $backup_fname_prefix = $backup_fname;
 
         //check to see fi the backup directory exists
         if (!file_exists($fpp_backup_location)) {
@@ -1737,11 +1759,63 @@ function doBackupDownload($settings_data, $area)
         }
 
         //Write a copy locally into "config/backups"
-        $backup_local_fpath = $fpp_backup_location . '/' . $backup_fname;
+        //
+        //The name carries a timestamp that is only precise to the second, so two
+        //backups started within the same second would pick the same name and one
+        //would silently overwrite the other.  A settings save now hands its backup
+        //to a detached process and returns (see PutSetting), so two backups
+        //overlapping is realistic rather than theoretical.  Claim the name with an
+        //exclusive create - the first process to get the file owns that second -
+        //and step forward a second at a time for anyone who loses the race.  The
+        //name has to stay strictly YmdHis: the listing recovers a backup's date by
+        //parsing everything after the last underscore.
+        $backup_stamp = time();
+        for ($backup_name_attempt = 0; $backup_name_attempt < 60; $backup_name_attempt++) {
+            $backup_fname = $backup_fname_prefix . date("YmdHis", $backup_stamp + $backup_name_attempt) . ".json";
+            $backup_local_fpath = $fpp_backup_location . '/' . $backup_fname;
+
+            $reserved = @fopen($backup_local_fpath, 'x');
+            if ($reserved !== false) {
+                //Ours.  The write below fills in the placeholder we just created.
+                fclose($reserved);
+                break;
+            }
+            if (!file_exists($backup_local_fpath)) {
+                //Failed for some reason other than the name being taken (an
+                //unwritable directory, say).  Stop here and let the write below
+                //fail and report it the way it always has.
+                break;
+            }
+        }
+
+        //Store the large, rarely-changing areas out of line so that every backup
+        //sharing an unchanged one shares a single copy of it - see
+        //ExtractBackupBlobs().  Only for backups that stay on the box: one being
+        //handed straight to a browser has to be self-contained, and is written
+        //whole.
+        $backup_blob_refs = array();
+        if ($fpp_backup_prompt_download == false) {
+            $settings_data = ExtractBackupBlobs(
+                $settings_data,
+                GetBackupBlobDir($fpp_backup_location),
+                $backup_blob_refs
+            );
+        }
+
         $json = json_encode($settings_data);
 
         //Write data into backup file
         if (file_put_contents($backup_local_fpath, $json) !== false) {
+            //Record what we just wrote in the metadata cache so that listing the
+            //backups - which pruneOrRemoveAgedBackupFiles() is about to do - does
+            //not have to read this whole file back to recover its fields.
+            RememberBackupMetadata(
+                $backup_local_fpath,
+                isset($settings_data['backup_comment']) ? $settings_data['backup_comment'] : '',
+                isset($settings_data['backup_trigger_source']) ? $settings_data['backup_trigger_source'] : null,
+                $backup_blob_refs
+            );
+
             //Once the backup has been written into our local directory, prune/remove any backups older than the max set age
             pruneOrRemoveAgedBackupFiles();
 
@@ -2057,6 +2131,37 @@ function pruneOrRemoveAgedBackupFiles()
         $aged_backup_removal_message = "SETTINGS BACKUP: Removed ($num_backups_deleted) old JSON settings backup files, because we only want to keep the $fpp_backup_min_number_kept most recent backups";
         error_log($aged_backup_removal_message . PHP_EOL);
     }
+
+    //Now the old backups are gone, drop any blob they were the last user of.
+    //
+    //$config_dir_files is the complete listing this function fetched above, so
+    //subtracting the ones just deleted leaves the full set of backups that
+    //remain - and every hash any of them still needs.  Working from anything
+    //less than a complete set would delete data that is still referenced, which
+    //is why this is done here and not from somewhere with a partial view.
+    $deleted_backups = array();
+    foreach ($backups_to_delete as $deleted_backup) {
+        $deleted_backups[$deleted_backup['backup_filename']] = true;
+    }
+
+    $referenced_blobs = array();
+    foreach ($config_dir_files as $remaining_backup) {
+        if (isset($deleted_backups[$remaining_backup['backup_filename']])) {
+            continue;
+        }
+        if (!empty($remaining_backup['backup_alternative_location'])) {
+            //Lives on the removable device, along with its own copy of the blobs
+            continue;
+        }
+        foreach (isset($remaining_backup['backup_blob_refs']) ? $remaining_backup['backup_blob_refs'] : array() as $hash) {
+            $referenced_blobs[$hash] = $hash;
+        }
+    }
+
+    $blobs_removed = CollectUnreferencedBackupBlobs(GetDirSetting('JsonBackups'), $referenced_blobs);
+    if ($blobs_removed > 0) {
+        error_log("SETTINGS BACKUP: Removed ($blobs_removed) stored config blobs that no remaining backup referenced" . PHP_EOL);
+    }
 }
 
 /**
@@ -2152,7 +2257,7 @@ if ($skipHTMLCodeOutput === false) {
         <title><?= $pageTitle ?></title>
         <!--    <script>var helpPage = "help/backup.php";</script>-->
         <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
-        <script src="js/fpp-backup-filecopy.js"></script>
+        <script src="js/fpp-backup-filecopy.js?ref=<?= filemtime('js/fpp-backup-filecopy.js'); ?>"></script>
 
         <?php
         $backupHosts = getKnownFPPSystems();

@@ -89,6 +89,11 @@ public:
     // Set the output refresh rate (fps).  Returns true when applied (or already
     // at that rate); a no-op returning false when unsupported.
     virtual bool SetRefreshRate(int fps) { return false; }
+    // Block until the page returned by Page() is no longer being scanned out,
+    // i.e. the previous SyncDisplay() flip has retired.  Lets a caller that
+    // prepares frames elsewhere copy into the free page without tearing.  The
+    // base class has no flip tracking, so this is a no-op.
+    virtual void WaitForPageFree() {}
 
     void FBStartDraw(ImageTransitionType transitionType = IT_Default);
 
@@ -152,7 +157,13 @@ protected:
     bool m_variableRefresh = false;
     uint8_t* m_buffer = nullptr;
     uint8_t* m_outputBuffer = nullptr;
-    uint8_t* m_pageBuffers[3] = { nullptr, nullptr, nullptr };
+    // m_pages must always be in [1, MAX_PAGES] and m_cPage/m_pPage must always
+    // be valid indices into m_pageBuffers, i.e. < m_pages.  Everything that
+    // dereferences a page goes through m_pageBuffers[m_cPage], so a page index
+    // pointing past what InitializeFrameBuffer() actually assigned reads a null
+    // pointer and faults on the first write.
+    static constexpr int MAX_PAGES = 3;
+    uint8_t* m_pageBuffers[MAX_PAGES] = { nullptr, nullptr, nullptr };
     int m_pageSize = 0;
 
     int m_pixelSize = 0;

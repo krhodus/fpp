@@ -34,6 +34,45 @@ var statusChangeFuncs = [];
 // system without the proxy_wstunnel apache module, an odd reverse proxy, or fppd
 // itself being down -- everything falls back to the full poll at gblStatusRefreshSeconds,
 // which is also the only path that can report "fppd Not Running".
+
+// The path prefix this FPP's document root is being served under, with a
+// trailing slash ('/' when it is served at the root).
+//
+// It cannot be derived from window.location.pathname.  That is the path of the
+// *page*, which says nothing about how much of it belongs to a reverse proxy:
+// /api/commandhelp.php and /proxy/1.2.3.4/index.php are indistinguishable by
+// shape, and matching one known proxy layout only ever works for that layout.
+//
+// This script is always at <root>/js/fpp.js, so its own resolved src is the one
+// thing that reliably names the prefix -- whatever it is, and whichever
+// subdirectory the page loading it lives in, since the browser has already
+// resolved '../js/fpp.js' and 'js/fpp.js' to the same absolute URL.
+//
+// currentScript is only valid while this file is first evaluated, so it is read
+// here at the top rather than at point of use.
+var gblFPPRoot = (function () {
+	var el = document.currentScript;
+	if (!el) {
+		var all = document.getElementsByTagName('script');
+		for (var i = 0; i < all.length; i++) {
+			if (/\/js\/fpp\.js(\?|$)/.test(all[i].src)) {
+				el = all[i];
+				break;
+			}
+		}
+	}
+	if (!el || !el.src) {
+		return '/';
+	}
+	try {
+		var path = new URL(el.src, document.baseURI).pathname;
+		var root = path.replace(/js\/fpp\.js.*$/, '');
+		return root.charAt(root.length - 1) === '/' ? root : root + '/';
+	} catch (e) {
+		return '/';
+	}
+})();
+
 var fppdWS = null;
 var fppdWSConnected = false;
 var fppdWSReconnectDelay = 1000; // ms, backoff up to 30s
@@ -568,7 +607,7 @@ function sortHTMLSelectByText (selector, skip_first, sortAscending) {
 }
 
 function getManualLink () {
-	return 'https://falconchristmas.github.io/FPP_Manual(9.x).pdf';
+	return 'https://manual.falconplayer.com';
 }
 
 function CloseModalDialog (id) {
@@ -1719,7 +1758,38 @@ function GetItemCount (url, id, key = '') {
 	});
 }
 
+// Hide every tooltip currently on screen.
+//
+// A tooltip whose trigger ends up underneath a modal can never dismiss itself.
+// On touch, the tap that opens a dialog fires an emulated mouseenter that shows
+// the tooltip, and the mouseleave that would hide it -- which is also what arms
+// the 3s auto-hide below -- can no longer reach a button the dialog is now
+// covering. Tooltips render at z-index 1080, above the modal's 1055, so the
+// hint is left stranded on top of the dialog with nothing on screen able to
+// clear it. A modal opening is therefore the moment to clear them, for every
+// titled control in the UI rather than per dialog.
+function HideAllToolTips () {
+	if (typeof bootstrap === 'undefined' || !bootstrap.Tooltip) {
+		return;
+	}
+	document.querySelectorAll('[data-bs-toggle="tooltip"]').forEach(function (el) {
+		var tooltipInstance = bootstrap.Tooltip.getInstance(el);
+		if (tooltipInstance) {
+			tooltipInstance.hide();
+		}
+	});
+}
+
 function SetupToolTips (delay = 100) {
+	// Delegated on document so it covers dialogs built long after this sweep,
+	// and namespaced + rebound because several pages call SetupToolTips again
+	// after adding markup -- without that, each call would stack another
+	// handler. Bootstrap 5 dispatches bubbling events, so the modal does not
+	// need to exist yet.
+	$(document)
+		.off('show.bs.modal.fppTooltips')
+		.on('show.bs.modal.fppTooltips', HideAllToolTips);
+
 	var titles = document.querySelectorAll('[title]');
 
 	titles.forEach(value => {
@@ -4086,9 +4156,18 @@ function SetUniverseCount (input) {
 	}
 }
 
+// DDP (4 and 5) and Twinkly (8) address a flat channel range rather than a run
+// of universes: fppd reads channelCount alone for these and never looks at the
+// universe number or the universe count, which is why the UI hides both inputs
+// for them.  Named rather than repeated so the three places that have to agree
+// on the list cannot drift apart.
+function isFlatUniverseType (type) {
+	return type == 4 || type == 5 || type == 8;
+}
+
 function IPOutputTypeChanged (item, input) {
 	var type = $(item).val();
-	if (type == 4 || type == 5 || type == 8) {
+	if (isFlatUniverseType(type)) {
 		// DDP, Twinkly
 		var univ = $(item).parent().parent().find('input.txtUniverse');
 		univ.prop('hidden', true);
@@ -4268,7 +4347,7 @@ function populateUniverseData (data, reload, input) {
 		var universeNumberDisable = '';
 		var monitorDisabled = '';
 		var ipDisabled = '';
-		if (type == 4 || type == 5 || type == 8) {
+		if (isFlatUniverseType(type)) {
 			universeSize = FPPD_MAX_CHANNELS;
 			universeCountDisable = ' disabled';
 			universeNumberDisable = ' disabled';
@@ -4789,16 +4868,23 @@ function postUniverseJSON (input) {
 		universe.startChannel = parseInt(
 			document.getElementById('txtStartAddress[' + i + ']').value
 		);
-		universe.universeCount = parseInt(
-			document.getElementById('numUniverseCount[' + i + ']').value
-		);
-
 		universe.channelCount = parseInt(
 			document.getElementById('txtSize[' + i + ']').value
 		);
 		universe.type = parseInt(
 			document.getElementById('universeType[' + i + ']').value
 		);
+		// The universe-count input is hidden for the flat types, but its value
+		// was still read and saved -- so a DDP or Twinkly row kept whatever was
+		// last left in that field.  fppd ignores it, but nothing reading the
+		// config back can tell a leftover from a real count, and multiplying by
+		// it gives a channel span that is wrong differently on every install.
+		// Write the one value that means "not a run of universes" instead.
+		universe.universeCount = isFlatUniverseType(universe.type)
+			? 1
+			: parseInt(
+					document.getElementById('numUniverseCount[' + i + ']').value
+			  );
 		universe.address = document.getElementById('txtIP[' + i + ']').value;
 		universe.priority = parseInt(
 			document.getElementById('txtPriority[' + i + ']').value
@@ -4934,7 +5020,7 @@ function validateUniverseData () {
 		// size
 		txtSize = document.getElementById('txtSize[' + i + ']');
 		var max = 512;
-		if (universeType == 4 || universeType == 5 || universeType == 8) {
+		if (isFlatUniverseType(universeType)) {
 			max = FPPD_MAX_CHANNELS;
 		}
 		if (!validateNumber(txtSize, 1, max)) {
@@ -5430,6 +5516,28 @@ function GetFPPStatus () {
 					message: 'FPPD Daemon is not running',
 					id: 1
 				});
+				// Additional warning when systemd has hit StartLimitBurst (too many restarts)
+				// Handles both cases: status already includes fppdRestartBlocked (from PHP's SystemGetStatus)
+				// and WebSocket status (lastStatusJSON) which does not — fetch via API in the latter case.
+				var checkBlocked = function(data) {
+					if (data && data.blocked) {
+						var s = parseInt(data.remainingSec) || 0;
+						var mins = Math.floor(s / 60);
+						var secs = s % 60;
+						var waitMsg = 'FPPD restart limit reached — please wait ' + (mins > 0 ? mins + 'm ' : '') + secs + 's before restarting';
+						var already = response.warnings.some(function(w){ return w.indexOf('restart limit') !== -1; });
+						if (!already) {
+							response.warnings.push(waitMsg);
+							response.warningInfo.push({message: waitMsg, id: 65});
+							updateWarnings(response);
+						}
+					}
+				};
+				if (response.fppdRestartBlocked && response.fppdRestartBlocked.blocked) {
+					checkBlocked(response.fppdRestartBlocked);
+				} else {
+					$.get('api/system/fppd/restartStatus').done(checkBlocked);
+				}
 			}
 			$.get('api/system/volume')
 				.done(function (data) {
@@ -6421,6 +6529,57 @@ function SingleStepSequence () {
 		});
 }
 
+// ---------------------------------------------------------------------------
+// Saving a setting is not instant.  The API writes the value and then APPLIES
+// it before it replies, and some of those applies are slow: restarting a
+// service, rewriting /etc/hostname, hashing a password with yescrypt, reloading
+// apache.  Several seconds with no feedback looks like the UI ignored the
+// change, so the setting's row gets a spinner for as long as its save is in
+// flight (the '.row.settingSaving' rule in css/fpp.css).
+//
+// The row is '<setting>Row', emitted by PrintSetting() in common.php, so every
+// setting type - checkbox, select, text, number, colour - gets the indicator
+// from here rather than each generated onChange handler rolling its own.
+function SettingRow (key) {
+	// Setting names may contain '.' (e.g. 'backup.Path'), which is a class
+	// separator in a jQuery selector unless it is escaped.
+	return $('#' + String(key).replace(/\./g, '\\.') + 'Row');
+}
+
+function SettingSaveStarted (key) {
+	SettingRow(key).addClass('settingSaving');
+}
+
+function SettingSaveFinished (key) {
+	SettingRow(key).removeClass('settingSaving');
+}
+
+// Setting saves used to be synchronous XHRs.  That serialized them, but it also
+// froze the browser for the whole request, so nothing the change handler drew
+// beforehand - a spinner included - could ever reach the screen.  They are async
+// now; queue them so exactly one is in flight at a time and the ordering the
+// synchronous calls used to guarantee is kept.  Rows waiting their turn show
+// their spinner straight away.
+var settingSaveQueue = [];
+var settingSaveInFlight = false;
+
+function QueueSettingSave (fn) {
+	settingSaveQueue.push(fn);
+	if (!settingSaveInFlight) {
+		RunNextSettingSave();
+	}
+}
+
+function RunNextSettingSave () {
+	var fn = settingSaveQueue.shift();
+	if (!fn) {
+		settingSaveInFlight = false;
+		return;
+	}
+	settingSaveInFlight = true;
+	fn();
+}
+
 function SetSettingReboot (key, value) {
 	SetSetting(key, value, 0, 1);
 }
@@ -6436,15 +6595,53 @@ function SetSetting (
 	failCallback = ''
 ) {
 	// console.log("api/settings/", key);
-	$.ajax({
-		url: 'api/settings/' + key,
-		data: '' + value,
-		method: 'PUT',
-		timeout: 1000,
-		async: false,
-		success: function () {
-			settings[key] = value;
-			if (key != 'restartFlag' && key != 'rebootFlag') {
+
+	// The restart/reboot flags are written from inside another save's success
+	// handler, whose callback may reload the page - the whole point of setting
+	// them there (see the comment further down).  Keep those two synchronous and
+	// out of the queue so the flag reaches disk before a reload can cancel the
+	// request.  They have no apply step, so the block is just the round trip.
+	if (key == 'restartFlag' || key == 'rebootFlag') {
+		$.ajax({
+			url: 'api/settings/' + key,
+			data: '' + value,
+			method: 'PUT',
+			async: false,
+			success: function () {
+				settings[key] = value;
+			}
+		}).fail(function () {
+			DialogError('Save Setting', 'Failed to save ' + key + ' setting.');
+			if (typeof failCallback === 'function') {
+				failCallback();
+			}
+		});
+		return;
+	}
+
+	// Silent background writes (hideChange) are not something the user asked
+	// for, so they get no spinner; everything else marks its row before the
+	// request goes out.
+	if (!hideChange) {
+		SettingSaveStarted(key);
+	}
+	QueueSettingSave(function () {
+		$.ajax({
+			url: 'api/settings/' + key,
+			data: '' + value,
+			method: 'PUT',
+			// The reply does not come back until the value has been applied, and
+			// an apply can legitimately run for several seconds.  The timeout is
+			// only here so a connection that dies mid-save cannot wedge the queue
+			// behind a request that will never complete.
+			timeout: 120000,
+			complete: function () {
+				SettingSaveFinished(key);
+				RunNextSettingSave();
+			},
+			success: function () {
+				settings[key] = value;
+
 				// Set restart/reboot flags BEFORE callback to ensure they're saved
 				// even if callback reloads the page
 				if (restart > 0 && restart != settings['restartFlag']) {
@@ -6468,19 +6665,19 @@ function SetSetting (
 					callback();
 				}
 			}
-		}
-	}).fail(function () {
-		if (isBool === null) {
-			DialogError('Save Setting', 'Failed to save ' + key + ' setting.');
-		} else if (isBool) {
-			DialogError('Save Setting', 'Failed to Enable ' + key + '.');
-		} else {
-			DialogError('Save Setting', 'Failed to Disable ' + key + '.');
-		}
-		if (typeof failCallback === 'function') {
-			failCallback();
-		}
-		CheckRestartRebootFlags();
+		}).fail(function () {
+			if (isBool === null) {
+				DialogError('Save Setting', 'Failed to save ' + key + ' setting.');
+			} else if (isBool) {
+				DialogError('Save Setting', 'Failed to Enable ' + key + '.');
+			} else {
+				DialogError('Save Setting', 'Failed to Disable ' + key + '.');
+			}
+			if (typeof failCallback === 'function') {
+				failCallback();
+			}
+			CheckRestartRebootFlags();
+		});
 	});
 }
 
@@ -6491,50 +6688,58 @@ function SetPluginSetting (
 	restart,
 	reboot,
 	isBool = false,
-	callback = ''
+	callback = '',
+	failCallback = ''
 ) {
-	$.ajax({
-		url: 'api/plugin/' + plugin + '/settings/' + key,
-		data: '' + value,
-		method: 'PUT',
-		timeout: 1000,
-		async: false,
-		success: function () {
-			if (key != 'restartFlag' && key != 'rebootFlag') {
-				// Set restart/reboot flags BEFORE callback to ensure they're saved
-				// even if callback reloads the page
-				if (restart > 0 && restart != settings['restartFlag']) {
-					SetRestartFlag(restart);
-				}
-				if (reboot > 0 && reboot != settings['rebootFlag']) {
-					SetRebootFlag(reboot);
-				}
-				CheckRestartRebootFlags();
+	SettingSaveStarted(key);
+	QueueSettingSave(function () {
+		$.ajax({
+			url: 'api/plugin/' + plugin + '/settings/' + key,
+			data: '' + value,
+			method: 'PUT',
+			// See SetSetting() above.
+			timeout: 120000,
+			complete: function () {
+				SettingSaveFinished(key);
+				RunNextSettingSave();
+			},
+			success: function () {
+				if (key != 'restartFlag' && key != 'rebootFlag') {
+					// Set restart/reboot flags BEFORE callback to ensure they're saved
+					// even if callback reloads the page
+					if (restart > 0 && restart != settings['restartFlag']) {
+						SetRestartFlag(restart);
+					}
+					if (reboot > 0 && reboot != settings['rebootFlag']) {
+						SetRebootFlag(reboot);
+					}
+					CheckRestartRebootFlags();
 
-				if (isBool === null) {
-					$.jGrowl(key + ' setting saved.', { themeState: 'success' });
-				} else if (isBool) {
-					$.jGrowl(key + ' Enabled.', { themeState: 'success' });
-				} else {
-					$.jGrowl(key + ' Disabled.', { themeState: 'detract' });
-				}
-				if (typeof callback === 'function') {
-					callback();
+					if (isBool === null) {
+						$.jGrowl(key + ' setting saved.', { themeState: 'success' });
+					} else if (isBool) {
+						$.jGrowl(key + ' Enabled.', { themeState: 'success' });
+					} else {
+						$.jGrowl(key + ' Disabled.', { themeState: 'detract' });
+					}
+					if (typeof callback === 'function') {
+						callback();
+					}
 				}
 			}
-		}
-	}).fail(function () {
-		if (isBool === null) {
-			DialogError('Save Setting', 'Failed to save ' + key + ' setting.');
-		} else if (isBool) {
-			DialogError('Save Setting', 'Failed to Enable ' + key + '.');
-		} else {
-			DialogError('Save Setting', 'Failed to Disable ' + key + '.');
-		}
-		CheckRestartRebootFlags();
-		if (typeof failCallback === 'function') {
-			failCallback();
-		}
+		}).fail(function () {
+			if (isBool === null) {
+				DialogError('Save Setting', 'Failed to save ' + key + ' setting.');
+			} else if (isBool) {
+				DialogError('Save Setting', 'Failed to Enable ' + key + '.');
+			} else {
+				DialogError('Save Setting', 'Failed to Disable ' + key + '.');
+			}
+			CheckRestartRebootFlags();
+			if (typeof failCallback === 'function') {
+				failCallback();
+			}
+		});
 	});
 }
 
@@ -13063,24 +13268,16 @@ function startFppdWS () {
 		fppdWSReconnectTimer = null;
 	}
 	var proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-	// Keep the current page's path prefix ONLY when viewed through FPP's
-	// built-in /proxy/<host>/ relay (etc/apache2.site), which serves another
-	// FPP's pages under a path prefix instead of at the root. A plain '/fppdws'
-	// there connects to THIS Apache's own fppd instead of the one being proxied
-	// to; mod_proxy_html can't fix this the way it rewrites static markup,
-	// since this URL is only ever built at runtime in the browser. The /proxy/
-	// Directory block's own WebSocket-upgrade rule already relays a prefixed
-	// path (e.g. /proxy/<ip>/fppdws) correctly - it just never receives one.
-	//
-	// Anywhere else the prefix has to be dropped: fppd registers the socket at
-	// the root (WS_PATH_ADD("/fppdws") in src/StatusWebSocket.cpp) and Apache
-	// only ProxyPasses /fppdws, so a page living in a subdirectory - /api/ (the
-	// API docs) or /wled/ - asked for ws://<host>/api/fppdws, which nothing
-	// listens on. That connection was refused and then retried forever, filling
-	// the console with NS_ERROR_WEBSOCKET_CONNECTION_REFUSED on those pages.
-	var proxyPrefix = window.location.pathname.match(/^\/proxy\/[^\/]+\//);
-	var pathPrefix = proxyPrefix ? proxyPrefix[0] : '/';
-	var url = proto + '//' + window.location.host + pathPrefix + 'fppdws';
+	// gblFPPRoot, not the page's own path: this URL is only ever built at
+	// runtime in the browser, so mod_proxy_html cannot rewrite it the way it
+	// rewrites static markup, and it has to name the same prefix the rest of
+	// the site is served under. Getting it from the page path instead meant a
+	// subdirectory page - /api/ (the API docs) or /wled/ - asked for
+	// ws://<host>/api/fppdws, which nothing listens on: fppd registers the
+	// socket at the root (WS_PATH_ADD("/fppdws") in src/StatusWebSocket.cpp).
+	// That was refused and retried forever, filling the console with
+	// NS_ERROR_WEBSOCKET_CONNECTION_REFUSED.
+	var url = proto + '//' + window.location.host + gblFPPRoot + 'fppdws';
 	// Detach the socket being replaced.  Belt and suspenders for the generation
 	// check below: an abandoned socket is unreachable once nothing points at its
 	// handlers, but the check is what makes a late event harmless either way.
@@ -13124,7 +13321,15 @@ function startFppdWS () {
 		} catch (e) {
 			return;
 		}
-		if (!msg || msg.type !== 'snapshot' || !msg.data || !msg.data.status) return;
+		if (!msg || msg.type !== 'snapshot' || !msg.data) return;
+		// Audio meters ride the same socket on their own key, at a much higher
+		// rate than status. Handed straight to whoever is drawing them and
+		// deliberately kept out of the status path below, which must only run
+		// for an actual status snapshot.
+		if (msg.data.levels && typeof window.PWMixerOnLevels === 'function') {
+			window.PWMixerOnLevels(msg.data.levels);
+		}
+		if (!msg.data.status) return;
 		// Only a parsed status snapshot may flip the page into WebSocket-fed
 		// mode.  Setting the flag on any received frame instead means a garbage
 		// or future non-snapshot frame switches the poll to ?systemonly=1 -- and
@@ -13261,6 +13466,53 @@ function SetSystemAugRefreshSeconds (seconds) {
  */
 function OnSystemStatusChange (funcToCall) {
 	statusChangeFuncs.push(funcToCall);
+}
+
+/*
+ * Keep an output test "Testing" dropdown in step with the test fppd is actually
+ * running.  fppd reports the running test in the status payload as testMode
+ * (same shape as api/testmode), so this follows a test started, changed or
+ * stopped from any tab or device -- and restores the dropdown on page load,
+ * since the first status snapshot arrives right after the WebSocket connects.
+ *
+ * selectId    -- id of the <select> whose option values are the test "type"s
+ * outputTypes -- the "outputs" names this page's tests are started with.  Pixel,
+ *                panel and PWM tests are all fppd mode "Outputs" with a numeric
+ *                type, so this is what keeps a panel test from claiming the
+ *                pixel dropdown (and vice versa).
+ *
+ * The value is set programmatically, which fires no change event, so the page
+ * never re-issues a test it merely observed.  Only a *changed* testMode is
+ * applied: a snapshot built between the user's Test Start and fppd acting on
+ * it still carries the previous state, and applying that would flip the
+ * dropdown back to Off for a second.
+ */
+function SyncTestModeSelect (selectId, outputTypes) {
+	if (!Array.isArray(outputTypes)) outputTypes = [outputTypes];
+	var lastApplied = null;
+	OnSystemStatusChange(function () {
+		if (!lastStatusJSON || !('status_name' in lastStatusJSON)) return; // not an fppd status yet
+		var tm = lastStatusJSON.testMode;
+		var key = tm ? JSON.stringify(tm) : '';
+		if (key === lastApplied) return;
+		lastApplied = key;
+
+		var sel = $('#' + selectId);
+		if (!sel.length) return;
+		var val = '0';
+		if (
+			tm &&
+			tm.enabled &&
+			tm.mode == 'Outputs' &&
+			tm.hasOwnProperty('type') &&
+			outputTypes.indexOf(String(tm.outputs)) !== -1
+		) {
+			val = String(tm.type);
+		}
+		if (sel.find("option[value='" + val + "']").length && sel.val() != val) {
+			sel.val(val);
+		}
+	});
 }
 
 /*
@@ -13659,6 +13911,24 @@ function RefreshHeaderBar () {
 		} else if (data.status_name == 'testing') {
 			row =
 				'<span title="Display Testing Active"><i class="fas fa-heart-pulse text-info"></i><small>Testing</small></span>';
+		} else if (data.status_name == 'playing media') {
+			var mtitle = 'Playing media outside a playlist';
+			if (data.current_song != undefined && data.current_song != '') {
+				mtitle += ':\n' + data.current_song;
+			}
+			row =
+				'<span title="' +
+				mtitle +
+				'"><i class="fas fa-music text-success"></i><small>Media</small></span>';
+		} else if (data.status_name == 'playing background') {
+			var btitle = 'Background audio playing';
+			if (data.current_song != undefined && data.current_song != '') {
+				btitle += ':\n' + data.current_song;
+			}
+			row =
+				'<span title="' +
+				btitle +
+				'"><i class="fas fa-music text-info"></i><small>Background</small></span>';
 		} else if (data.status_name == 'idle') {
 			row =
 				'<span title="Idle"><i class="fas fa-pause"></i><small>Idle</small></span>';
@@ -14077,4 +14347,21 @@ function updateNavbarUpdateIndicator () {
 	} else {
 		$('#navbarUpdateAvail').hide();
 	}
+}
+
+/**
+ * Set by menuHead.inc from GPIOPlatformHasStablePinNumbers(): whether this platform's
+ * gpiochip/line numbering is fixed enough to put in front of a user.  On the
+ * BeagleBones -- and behind any i2c GPIO expander -- it is assigned by an
+ * asynchronous boot-time probe and can move between boots, so we show the header pin
+ * name alone.
+ */
+var fppShowPinGpioNumbers = fppShowPinGpioNumbers || false;
+
+/**
+ * Whether a header pin should be annotated with the GPIO it maps to.  Pi 40-pin
+ * header only; expander pins on a Pi carry the same boot-order caveat as the BBBs.
+ */
+function fppPinHasGpioNumbers(pin) {
+	return fppShowPinGpioNumbers && /^P1-/.test(String(pin));
 }

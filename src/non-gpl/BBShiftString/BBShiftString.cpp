@@ -31,6 +31,7 @@
 
 // FPP includes
 #include "../../Sequence.h"
+#include "../../channeloutput/channeloutputthread.h"
 #include "../../Warnings.h"
 #include "../../common.h"
 #include "../../log.h"
@@ -103,6 +104,10 @@ BBShiftStringOutput::BBShiftStringOutput(unsigned int startChannel, unsigned int
  */
 BBShiftStringOutput::~BBShiftStringOutput() {
     LogDebug(VB_CHANNELOUT, "BBShiftStringOutput::~BBShiftStringOutput()\n");
+    // idempotent; Close() normally does this, but an output torn down without
+    // one must not leave its frame rate warning stranded in the UI
+    setFrameRateWarning(false);
+    clearBudgetWarning();
     BBBPru::ddrRelease("BBShiftString");
     m_pumpRunning = false;
     if (m_pumpThread.joinable()) {
@@ -354,6 +359,32 @@ int BBShiftStringOutput::Init(Json::Value config) {
         return 0;
     }
 
+    // The cape's string config has to be one written for this driver.  Here an
+    // output is a place in the cape's shift register chains (numeric "pru",
+    // "pin" and "index"); on a BBB48String cape it is a header pin name
+    // ("pin": "P8-08").  Reading a pin name as an int throws out of jsoncpp and
+    // reaches the user as a bare "Value is not convertible to Int.", so name the
+    // real problem instead: the config asked for the wrong driver for this cape.
+    // Configs like that do arrive - xLights 2026.16 pointed an early K16A-B at
+    // this driver, a revision whose eeprom predates it and so is still a
+    // BBB48String pinout (and names no "driver" at all, hence the default
+    // below; later revisions of the same cape do belong here).
+    const int capeOutputCount = root["outputs"].size();
+    for (int i = 0; i < capeOutputCount; i++) {
+        // a string "pin" is the unambiguous BBB48String signature; a missing
+        // one is left to the null-reads-as-0 behaviour the shift capes have
+        // always relied on for their unused fields
+        if (!root["outputs"][i]["pin"].isString()) {
+            continue;
+        }
+        std::string capeDriver = root.get("driver", "BBB48String").asString();
+        LogErr(VB_CHANNELOUT, "Cape %s is not a BBShiftString cape - its string configuration names header pins, so it needs the %s output type\n",
+               m_subType.c_str(), capeDriver.c_str());
+        WarningHolder::AddWarning("BBShiftString: " + m_subType + " needs the " + capeDriver +
+                                  " output type - open the Pixel Strings page and save to correct it");
+        return 0;
+    }
+
     // A combo cape shares the PRUSS with a panel driver: this side must not
     // clear the shared RAM or the other PRU's memory on a restart, and the
     // FalconV5 listener (a PRU0 program whose capture area overlaps the
@@ -490,6 +521,15 @@ int BBShiftStringOutput::Init(Json::Value config) {
     }
     m_hasBidirSR = hasV5SR;
 
+    // On a cape that wires the receiver enable line to PRU1, that pin gates
+    // the whole differential bus, so it has to be configured whenever the
+    // cape has it - not just for Falcon receivers, and not just for smart
+    // receivers at all.  Left unconfigured, nothing downstream of it gets
+    // data, dumb strings included.  Configuring it also commits us to
+    // actually running PRU1 (see the maxStringLen bump below): the firmware
+    // parks the pin in its disabled state, so a halted PRU1 holds it there.
+    m_usesEnablePin = supportsV5Listeners;
+
     int curRecPort = -1;
     for (int x = 0; x < m_strings.size(); x++) {
         if (curRecPort == -1 && (m_strings[x]->smartReceiverType == PixelString::ReceiverType::FalconV5 ||
@@ -501,9 +541,28 @@ int BBShiftStringOutput::Init(Json::Value config) {
                 curRecPort = m_strings[x]->m_portNumber % 4;
             }
             // need to output this pin, configure it
+            if (x >= capeOutputCount) {
+                // the loop above only vetted the outputs the cape declares;
+                // a config with more ports than that has nowhere to send them
+                // (and a bare operator[] here would read a null entry as
+                // pru 0 / pin 0 / stage 0, colliding with a real port)
+                LogErr(VB_CHANNELOUT, "Output %d is past the %d the %s cape declares\n",
+                       x + 1, capeOutputCount, m_subType.c_str());
+                WarningHolder::AddWarning("BBShiftString: output " + std::to_string(x + 1) +
+                                          " is past the end of the cape's pinout");
+                continue;
+            }
             int pru = root["outputs"][x]["pru"].asInt();
             int pin = root["outputs"][x]["pin"].asInt();
             int pinIdx = root["outputs"][x]["index"].asInt();
+            if (pru < 0 || pru > 1) {
+                // m_dataPins/m_ctrlPins/m_pinNamesOverridden are all [2]; a
+                // cape pinout written for a different driver can name a pru
+                // outside that range and would index straight past them
+                LogErr(VB_CHANNELOUT, "Output %d names pru %d but only pru 0 and 1 exist\n", x, pru);
+                WarningHolder::AddWarning("BBShiftString: output " + std::to_string(x) + " names an invalid pru");
+                continue;
+            }
             if (pinIdx < 0 || pinIdx >= m_stringsPerPin) {
                 LogErr(VB_CHANNELOUT, "Output %d has shift stage index %d but the cape declares %d strings per pin\n",
                        x, pinIdx, m_stringsPerPin);
@@ -570,9 +629,23 @@ int BBShiftStringOutput::Init(Json::Value config) {
             }
         }
     }
-    if (hasV5SR && m_pru1.maxStringLen <= m_pru0.maxStringLen) {
-        // pru1 controls the reading mux pins so it has to output more pixels than pru0 so it knows pru0 is done
+    if (m_usesEnablePin && m_pru1.maxStringLen <= m_pru0.maxStringLen) {
+        // pru1 controls the enable/reading mux pins so it has to output more pixels
+        // than pru0 so it knows pru0 is done (and so it is started at all)
         m_pru1.maxStringLen = m_pru0.maxStringLen + 1;
+    }
+
+    int maxLen = std::max(m_pru0.maxStringLen, m_pru1.maxStringLen);
+    if (maxLen > 0) {
+        // m_lowNs is the programmed bit cell from resolveTiming(); the bit loop
+        // carries ~130ns/bit of instruction time outside the waits.  Measured
+        // on a K32-Max at two cells: ws281x 1120 -> 1245-1252ns achieved,
+        // ucs1903 2500 -> 2619ns achieved.  The 1700us covers the reset gap
+        // and receiver packet staging (#2855).
+        int bitNs = m_lowNs + 130;
+        m_frameTimeUs = (int)((maxLen * 8LL * bitNs) / 1000) + 1700;
+        LogInfo(VB_CHANNELOUT, "BBShiftString: longest string %d bytes at %dns/bit -> %.1fms/frame, sustainable ceiling ~%.4g fps\n",
+                maxLen, bitNs, m_frameTimeUs / 1000.0, 1000000.0 / m_frameTimeUs);
     }
 
     if (!StartPRU()) {
@@ -621,9 +694,9 @@ int BBShiftStringOutput::Init(Json::Value config) {
     m_pru1.formattedData = (uint8_t*)calloc(1, m_pru1.frameSize);
 #endif
 
-    if (supportsV5Listeners && hasV5SR) {
-        // if the cape supports v5 listeners, the enable pin needs to be
-        // configured or data won't be sent on port1 of each receiver
+    if (m_usesEnablePin) {
+        // without this the enable line stays unconfigured and nothing
+        // behind it - receiver port 1, dumb strings - gets data
         PinCapabilities::getPinByName(PRU1_ENABLE_PIN).configPin("pru1out", true, "BBShiftString-Enable");
     }
     if (hasFalconSR) {
@@ -718,6 +791,9 @@ static std::string pruFirmware(int pru, int stringsPerPin) {
 
 int BBShiftStringOutput::StartPRU() {
     m_curFrame = 0;
+    m_bpOffered = 0;
+    m_bpDeclined = 0;
+    m_bpWindowStart = {};
     for (auto& a : m_usedPins) {
         PinCapabilities::getPinByName(a.first).configPin(a.second, true, "BBShiftString");
     }
@@ -860,10 +936,12 @@ int BBShiftStringOutput::Close(void) {
         PixelOverlayManager::INSTANCE.removeAutoOverlayModel(n);
     }
     StopPRU();
+    setFrameRateWarning(false);
+    clearBudgetWarning();
     for (auto& a : m_usedPins) {
         PinCapabilities::getPinByName(a.first).releasePin();
     }
-    if (supportsV5Listeners && m_hasBidirSR) {
+    if (m_usesEnablePin) {
         PinCapabilities::getPinByName(PRU1_ENABLE_PIN).releasePin();
     }
     return ChannelOutput::Close();
@@ -1300,15 +1378,163 @@ void BBShiftStringOutput::sendData(FrameData& d) {
     }
 }
 
+// Persistent UI warning for "the sequence rate is past what these strings can
+// clock out".  The flag is per output so Close() can retract it; a warning left
+// behind by an output that no longer exists has nothing left to clear it.
+void BBShiftStringOutput::setFrameRateWarning(bool on) {
+    static const std::string BP_WARN =
+        "Sequence frame rate is higher than the configured pixel strings can output; frames are being dropped";
+    if (on == m_bpWarned) {
+        return;
+    }
+    if (on) {
+        WarningHolder::AddWarning(61, BP_WARN);
+    } else {
+        WarningHolder::RemoveWarning(61, BP_WARN);
+    }
+    m_bpWarned = on;
+}
+
+// Predictive companion to the measured warning above, run whenever the
+// refresh rate changes.  Sequence.cpp publishes the sequence's rate before the
+// first frame reaches SendData(), so an over-budget configuration is flagged
+// immediately instead of after a minute of measured drops - and a rate that
+// changes mid-playlist (sequences at different frame rates back to back, where
+// the output thread never restarts) is caught on the next frame.
+void BBShiftStringOutput::checkFrameRateBudget(float rate) {
+    if (m_frameTimeUs <= 0) {
+        return;
+    }
+    float ceiling = 1000000.0f / m_frameTimeUs;
+    // 5% grace: covers the overhead constant's own uncertainty (the receiver
+    // packet share of the 1700us is config-dependent) and keeps a config a
+    // hair past budget - absorbed invisibly by the back-pressure gate - quiet
+    if (rate > ceiling * 1.05f) {
+        char buf[192];
+        snprintf(buf, sizeof(buf),
+                 "Sequence frame rate (%.4g fps) is higher than the configured pixel strings can output (~%.4g fps); frames will be dropped",
+                 rate, ceiling);
+        std::string msg = buf;
+        if (msg != m_budgetWarnText) {
+            clearBudgetWarning();
+            LogWarn(VB_CHANNELOUT, "BBShiftString: %s\n", msg.c_str());
+            WarningHolder::AddWarning(63, msg);
+            m_budgetWarnText = msg;
+        }
+    } else {
+        clearBudgetWarning();
+    }
+}
+
+void BBShiftStringOutput::clearBudgetWarning() {
+    if (!m_budgetWarnText.empty()) {
+        WarningHolder::RemoveWarning(63, m_budgetWarnText);
+        m_budgetWarnText.clear();
+    }
+}
+
 int BBShiftStringOutput::SendData(unsigned char* channelData) {
     LogExcess(VB_CHANNELOUT, "BBShiftStringOutput::SendData(%p)\n", channelData);
     if (!hasStrings()) {
         return 0;
     }
 
+    float bwRate = GetChannelOutputRefreshRate();
+    if (bwRate != m_lastBudgetRate) {
+        m_lastBudgetRate = bwRate;
+        checkFrameRateBudget(bwRate);
+    }
+
     if (falconV5Support) {
         falconV5Support->processListenerData();
     }
+
+#ifndef PLATFORM_BBB
+    // ---- back-pressure gate --------------------------------------------------
+    // pumpFrameData() only snapshots pendingFrame once the firmware is ready for
+    // another frame (command == 0 && ring drained).  A frame staged before that
+    // point is simply overwritten and never rendered.  When the requested frame
+    // rate exceeds what the configured string length can physically clock out,
+    // that surplus of never-rendered frames is what eventually leaves the PRU
+    // ring misaligned (#2855).  Declining the frame while the previous one is
+    // still pending drives the surplus to zero at whatever rate the hardware
+    // actually sustains - frame dropping at the source, with no fixed divisor
+    // to mis-tune, and configurations already inside their budget are untouched
+    // (nothing is pending when the next frame arrives, so nothing is declined).
+    //
+    // It is also what keeps the two-phase write of pendingFrame safe: sendData()
+    // fills the byte counts and the block below fills the command, and only a
+    // frame the pump has already taken may be restaged, so the pump can never
+    // snapshot one phase of one frame with the other phase of the next.  Ditto
+    // the FalconV5 packet cursor - curV5ConfigPacket only advances for a frame
+    // that will actually be streamed, where before, over budget, better than
+    // half the receiver's config and dynamic packets were marked consumed and
+    // never sent.
+    //
+    // AM335x never reaches this: it has no ring and no pump, every frame
+    // restates its own DDR address and length, and pendingSeq is never bumped.
+    //
+    // Cannot wedge: we only decline while pendingSeq != pumpedSeq, so
+    // pumpFrameData() still enters its busy branch and its 250ms watchdog
+    // still runs.  A PRU is only party to the gate if the pump actually
+    // services it (pump thread condition below) - otherwise its pendingSeq
+    // would climb against a pumpedSeq nothing advances and every frame,
+    // including the other PRU's, would be declined forever.
+    //
+    // A declined frame is not retried, so a one-shot frame can land late: the
+    // end-of-sequence blank is offered three times (the forced output, then
+    // twice more as onceMore unwinds), the last of those BridgeLightDelay
+    // (E131BridgingInterval, 50ms default) after the one before it, which is
+    // past the drain time of any frame this gate declines.  Set that interval
+    // below a frame's clocking time and blanking would be delayed further.
+    {
+        bool taken = true;
+        if (m_pru1.pru && m_pru1.ring.attached()) {
+            taken = taken && (m_pru1.pendingSeq.load(std::memory_order_acquire) ==
+                              m_pru1.pumpedSeq.load(std::memory_order_acquire));
+        }
+        if (m_pru0.pru && m_pru0.ring.attached()) {
+            taken = taken && (m_pru0.pendingSeq.load(std::memory_order_acquire) ==
+                              m_pru0.pumpedSeq.load(std::memory_order_acquire));
+        }
+        ++m_bpOffered;
+        if (!taken) {
+            ++m_bpDeclined;
+        }
+        // report on a wall-clock window rather than a frame count so the
+        // hysteresis reacts at the same speed whatever the sequence rate
+        auto now = std::chrono::steady_clock::now();
+        if (m_bpWindowStart.time_since_epoch().count() == 0) {
+            m_bpWindowStart = now;
+        } else if ((now - m_bpWindowStart) >= std::chrono::seconds(60)) {
+            if (m_bpDeclined) {
+                LogWarn(VB_CHANNELOUT,
+                        "BBShiftString: back-pressure gate declined %u of %u frames (%.1f%%)\n",
+                        m_bpDeclined, m_bpOffered, 100.0 * m_bpDeclined / m_bpOffered);
+            } else {
+                LogInfo(VB_CHANNELOUT, "BBShiftString: back-pressure gate declined no frames of %u\n",
+                        m_bpOffered);
+            }
+            // Surface a persistent UI warning once the sequence rate is clearly
+            // beyond what the strings can output; clear it again when the rate
+            // drops back (e.g. a different sequence starts).  The thresholds
+            // are hysteresis: on at >=10% dropped, off again below 2%.
+            if (m_bpDeclined * 10 >= m_bpOffered) {
+                setFrameRateWarning(true);
+            } else if (m_bpDeclined * 50 <= m_bpOffered) {
+                setFrameRateWarning(false);
+            }
+            m_bpOffered = 0;
+            m_bpDeclined = 0;
+            m_bpWindowStart = now;
+        }
+        if (!taken) {
+            return m_channelCount;
+        }
+    }
+    // --------------------------------------------------------------------------
+#endif
+
     sendData(m_pru0);
     sendData(m_pru1);
     // make sure memory is flushed before command is set to 1
@@ -1347,7 +1573,8 @@ int BBShiftStringOutput::SendData(unsigned char* channelData) {
         m_pru0.pruData->command = c;
 #else
         // the pump thread writes the command once the PRU has taken the
-        // previous one, matching the latest-frame-wins drop behavior
+        // previous one; the gate above guarantees the previous one is gone,
+        // so this can never overwrite a frame the pump has yet to snapshot
         m_pru0.pendingFrame.command = c;
         m_pru0.pendingSeq.fetch_add(1, std::memory_order_release);
 #endif
@@ -1396,7 +1623,7 @@ bool BBShiftStringOutput::pumpFrameData(FrameData& d) {
         // still buffered when the first command went out, and every frame
         // after that renders that many bytes into the previous one.  Streaming
         // ahead within a frame is unaffected (that is the loop below).
-        if (seq == d.pumpedSeq) {
+        if (seq == d.pumpedSeq.load(std::memory_order_relaxed)) {
             return false;
         }
         if (d.pruData->command != 0 || !d.ring.drained()) {
@@ -1421,12 +1648,21 @@ bool BBShiftStringOutput::pumpFrameData(FrameData& d) {
             return false;
         }
         d.stalledSince = {};
-        // snapshot the newest pending frame; retry if SendData raced us
-        do {
-            d.pumpedSeq = seq;
+        // Snapshot the newest pending frame; retry if SendData raced us.
+        // pumpedSeq is published only once the copy is known good, never
+        // before it: the back-pressure gate in SendData() treats
+        // pumpedSeq == pendingSeq as its licence to restage, so publishing
+        // first would invite the output thread to rewrite pendingFrame while
+        // this copy is still reading it.
+        while (true) {
+            uint32_t snapped = seq;
             d.activeFrame = d.pendingFrame;
             seq = d.pendingSeq.load(std::memory_order_acquire);
-        } while (seq != d.pumpedSeq);
+            if (seq == snapped) {
+                d.pumpedSeq.store(snapped, std::memory_order_release);
+                break;
+            }
+        }
         d.activeOff = 0;
         d.pumpActive = true;
         // Publish where in the ring this frame starts before the command that

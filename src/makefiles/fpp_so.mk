@@ -70,9 +70,12 @@ OBJECTS_fpp_so += \
 	mediaoutput/mediaoutput.o \
 	mediaoutput/AES67Manager.o \
 	mediaoutput/AudioSourceRegistry.o \
+	mediaoutput/AudioLevelMonitor.o \
 	mediaoutput/OpusRTPManager.o \
+	mediaoutput/PipeWireGraphConfig.o \
 	mediaoutput/GStreamerOut.o \
 	mediaoutput/StreamSlotManager.o \
+	mediaoutput/V4L2Device.o \
 	mediaoutput/VideoInputManager.o \
 	mediaoutput/VideoOutputManager.o \
 	mqtt.o \
@@ -164,7 +167,7 @@ LIBS_fpp_so += \
 # the PCH and the mediaoutput/ class layouts diverge (see the note there).
 # Only the core links them, so the libraries are picked up here.  Both
 # variables are empty when the library is absent, so no guard is needed.
-LIBS_fpp_so += $(GSTREAMER_LIBS) $(LIBDRM_LIBS)
+LIBS_fpp_so += $(GSTREAMER_LIBS) $(LIBDRM_LIBS) $(SAMPLERATE_LIBS)
 
 
 util/tinyexpr.o: util/tinyexpr.c fppversion_defines.h Makefile makefiles/*.mk makefiles/platform/*.mk $(PCH_FILE)

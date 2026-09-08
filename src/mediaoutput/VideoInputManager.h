@@ -12,6 +12,7 @@
  */
 
 #include <atomic>
+#include <cstdint>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -71,6 +72,18 @@ public:
     /// Returns the detected (or configured) fps, or 0 if not found.
     int GetSourceFramerate(const std::string& channelName) const;
 
+    /// Grab a single JPEG frame from a running source, for UI preview.
+    ///
+    /// Taps the source's intervideo channel with a short-lived
+    /// intervideosrc, so it costs the source pipeline nothing and — unlike
+    /// opening /dev/videoN a second time — never contends with the capture
+    /// device (UVC cameras allow a single opener).
+    ///
+    /// Returns false if the source isn't running or no frame arrived within
+    /// timeoutMs.
+    bool GrabSnapshotJPEG(int sourceId, int maxWidth, int timeoutMs,
+                          std::vector<uint8_t>& jpegOut);
+
 private:
     VideoInputManager() = default;
     ~VideoInputManager();
@@ -90,6 +103,15 @@ private:
 
         // v4l2src settings
         std::string device;          // "/dev/video0"
+
+        // v4l2src device controls.  Defaults mean "leave the camera's own
+        // setting alone", so a config written before these existed behaves
+        // exactly as it did.  See V4L2Device.h for why these are device
+        // controls and not something the pipeline can do downstream.
+        int powerLineFrequency = -1;      // -1 camera default, 0 off, 1 = 50Hz, 2 = 60Hz
+        std::string exposureMode = "camera"; // "camera", "auto", "manual"
+        int exposureTime100us = -1;       // manual shutter, 100us units
+        int dynamicFramerate = -1;        // -1 camera default, 0 hold fps, 1 allow AE to drop it
 
         // rtspsrc settings
         std::string uri;             // "rtsp://host/path"
@@ -132,6 +154,10 @@ private:
               pipeWireNodeName(std::move(o.pipeWireNodeName)),
               enabled(o.enabled), pattern(std::move(o.pattern)),
               device(std::move(o.device)),
+              powerLineFrequency(o.powerLineFrequency),
+              exposureMode(std::move(o.exposureMode)),
+              exposureTime100us(o.exposureTime100us),
+              dynamicFramerate(o.dynamicFramerate),
               uri(std::move(o.uri)), latency(o.latency),
               bufferSec(o.bufferSec),
               port(o.port), encoding(std::move(o.encoding)),
@@ -165,6 +191,11 @@ private:
 
     /// Build and start pipeline with separate video + audio streams.
     bool StartSourceWithAudio(SourceInfo& source);
+
+    /// Build the capsfilter constraining what we ask the capture device
+    /// for, or "" to leave the device unconstrained.  See the call site
+    /// for why an unsupported mode must not be pinned.
+    std::string BuildDeviceCaps(const SourceInfo& source);
 
     /// Stop a single source pipeline.
     void StopSource(SourceInfo& source);

@@ -660,7 +660,7 @@ install_base_packages() {
                       libmosquitto-dev mosquitto-clients mosquitto libzstd-dev lzma zstd gpiod libgpiod-dev libjsoncpp-dev libcurl4-openssl-dev libnl-3-dev libnl-genl-3-dev \
                       fonts-freefont-ttf flex bison pkg-config libasound2-dev libsdl2-dev libsdl3-dev mesa-common-dev qrencode libusb-1.0-0-dev \
                       pipewire pipewire-bin pipewire-alsa pipewire-pulse pipewire-jack pipewire-audio-client-libraries wireplumber \
-                      libpipewire-0.3-dev libspa-0.2-bluetooth pulseaudio-utils linuxptp \
+                      libpipewire-0.3-dev libspa-0.2-bluetooth pulseaudio-utils linuxptp libsamplerate0-dev \
                       gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-base-apps gstreamer1.0-plugins-good gstreamer1.0-alsa \
                       gstreamer1.0-plugins-bad gstreamer1.0-plugins-ugly gstreamer1.0-pipewire \
                       gstreamer1.0-libav gstreamer1.0-gl gstreamer1.0-x \
@@ -1738,7 +1738,12 @@ mkdir ${FPPHOME}/.ssh
 chown ${FPPUSER}:${FPPUSER} ${FPPHOME}/.ssh
 chmod 700 ${FPPHOME}/.ssh
 
-mkdir ${FPPHOME}/media
+# -p, not a bare mkdir: an upgrade script run earlier in this same install (see
+# upgrade_config above) can legitimately have created a subdirectory of the
+# media dir already, and failing here aborts the entire install under set -e.
+# The chown/chmod below then puts an early-created dir back under fpp's
+# ownership either way.
+mkdir -p ${FPPHOME}/media
 chown ${FPPUSER}:${FPPUSER} ${FPPHOME}/media
 chmod 775 ${FPPHOME}/media
 
@@ -2094,20 +2099,28 @@ configure_apache() {
     # That happens on any box booted with ipv6.disable=1, and on any box
     # running a kernel whose ipv6 module is missing.
     #
-    # So decide at *start* time rather than install time: apachectl sources
-    # envvars on every start/restart/configtest, so a box that gains or
-    # loses IPv6 later recovers on its own without reinstalling.
+    # <IfFile> is evaluated every time the config is parsed -- on start, on
+    # configtest, and on the SIGUSR1 re-read behind "systemctl reload" -- so
+    # the choice is never baked into how the master happened to be started,
+    # and a box that gains or loses IPv6 later corrects itself. (Contrast an
+    # <IfDefine> fed from envvars: the define lives on the master's argv, so a
+    # reload re-reads this file with whatever defines the *running* master
+    # started with and can silently pick the wrong branch.)
+    #
+    # <IfFile> needs apache 2.4.34+; the oldest release FPP installs on is
+    # well past that (Debian buster ships 2.4.38).
     cat > /etc/apache2/ports.conf <<'PORTS_EOF'
 # Managed by FPP -- see configure_apache() in SD/FPP_Install.sh.
-# FPP_HAVE_IPV6 is defined from /etc/apache2/envvars when the running
-# kernel actually has IPv6, so a box without it still serves over IPv4
+# /proc/sys/net/ipv6 is absent both when the ipv6 module is missing and when
+# the kernel booted with ipv6.disable=1 -- exactly the cases where
+# "Listen [::]:80" aborts apache startup -- so such a box serves over IPv4
 # instead of failing to start apache at all.
-<IfDefine FPP_HAVE_IPV6>
+<IfFile /proc/sys/net/ipv6>
 Listen [::]:80
-</IfDefine>
-<IfDefine !FPP_HAVE_IPV6>
+</IfFile>
+<IfFile !/proc/sys/net/ipv6>
 Listen 80
-</IfDefine>
+</IfFile>
 
 <IfModule ssl_module>
 	Listen 443
@@ -2118,17 +2131,10 @@ Listen 80
 </IfModule>
 PORTS_EOF
 
-    if ! grep -q FPP_HAVE_IPV6 /etc/apache2/envvars; then
-        cat >> /etc/apache2/envvars <<'ENVVARS_EOF'
-
-## FPP: only ask apache for the IPv6 wildcard listener when the running
-## kernel has IPv6. /proc/sys/net/ipv6 is absent both when the module is
-## missing and when the kernel booted with ipv6.disable=1, which are exactly
-## the cases where "Listen [::]:80" aborts apache startup.
-if [ -d /proc/sys/net/ipv6 ]; then
-	export APACHE_ARGUMENTS="${APACHE_ARGUMENTS} -D FPP_HAVE_IPV6"
-fi
-ENVVARS_EOF
+    # Drop the APACHE_ARGUMENTS define an older FPP appended here; ports.conf
+    # probes for IPv6 itself now and nothing reads FPP_HAVE_IPV6 any more.
+    if grep -q FPP_HAVE_IPV6 /etc/apache2/envvars; then
+        sed -i '/^## FPP: only ask apache for the IPv6/,/^fi$/d' /etc/apache2/envvars
     fi
 
     cat /opt/fpp/etc/apache2.site   > /etc/apache2/sites-enabled/000-default.conf
@@ -2420,6 +2426,21 @@ if $isimage; then
 fi
 
 install_fpp_services
+
+#######################################
+# FPP's Web/HTTP video inputs resolve YouTube URLs by shelling out to yt-dlp.
+# The packaged yt-dlp is frozen for the life of the Debian release while
+# YouTube reworks its player every few months, so an image built today ships a
+# yt-dlp that stops resolving anything within months -- the video input just
+# never produces a frame. Install upstream's standalone build (into
+# /usr/local/bin, which precedes /usr/bin in fppd's PATH, so it shadows the
+# package rather than replacing it) and leave the daily refresh behind.
+# Best-effort: no internet at install time just means the packaged yt-dlp
+# stands in until the first daily run that has some.
+echo "FPP - Installing upstream yt-dlp and its daily refresh"
+cp /opt/fpp/etc/update-ytdlp /etc/cron.daily/
+chmod 0755 /etc/cron.daily/update-ytdlp
+/opt/fpp/scripts/update_ytdlp.sh || true
 
 if $isimage; then
     finalize_image_services

@@ -52,6 +52,12 @@ constexpr int DEFAULT_BITRATE       = 128000;    // 128 kbps
 constexpr int DEFAULT_PACKET_LOSS   = 5;         // 5% expected loss
 constexpr int MULTICAST_TTL         = 4;
 
+// DSCP codepoint for the RTP audio stream (udpsink qos-dscp).  AF41, the same
+// marking AES67 audio uses.  It matters more here than there: this is the WiFi
+// transport, and WiFi maps DSCP onto WMM access categories (AF41 -> AC_VI), so
+// the marking decides how the stream contends on a busy AP.
+constexpr int AUDIO_DSCP            = 34;      // AF41
+
 constexpr const char* DEFAULT_DEST_IP = "239.69.1.1";
 
 // Valid bitrates (bps)
@@ -82,6 +88,29 @@ struct OpusRTPInstance {
 
 struct OpusRTPConfig {
     std::vector<OpusRTPInstance> instances;
+
+    // Hold a sender idle until something in the audio graph actually feeds it.
+    //
+    // A send instance is a PipeWire *sink*: its pipewiresrc is created with
+    // node.autoconnect=false, so nothing links into it unless an Audio Output
+    // Group member names it as node.target.  With nothing linked the pipeline
+    // cannot preroll, and gst_element_set_state() sits there for 30 seconds
+    // before returning FAILURE -- per instance, on every Apply.  That is the
+    // chicken and egg a new instance walks straight into: it cannot be added
+    // to a group until it has been saved, and saving it costs half a minute of
+    // dead UI and a "stream failed to start" warning for a stream the user has
+    // not finished configuring yet.
+    //
+    // So when nothing feeds it, do not start it at all: the instance stays
+    // configured, ApplyConfig() returns promptly, GetStatus() reports it as
+    // waiting rather than failed, and the next apply -- which the Audio Output
+    // Groups page performs anyway, by restarting the stack -- starts it for
+    // real.  See PipeWireGraphFeedsNode().
+    //
+    // Set false in pipewire-opus-rtp-instances.json for a graph FPP did not
+    // generate (a hand-written PipeWire conf, or nodes linked by hand with
+    // pw-link), where the group config cannot answer the question.
+    bool requireGroupSource = true;
 };
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -134,6 +163,13 @@ public:
             std::string mode;
             bool running;
             std::string error;
+            // Configured and enabled, but deliberately not started because
+            // nothing in the audio graph feeds it -- see
+            // OpusRTPConfig::requireGroupSource.  Not an error: `note` carries
+            // the reason for the UI to render as guidance rather than a
+            // failure.
+            bool waitingForSource = false;
+            std::string note;
         };
         std::vector<PipelineStatus> pipelines;
     };
@@ -162,6 +198,21 @@ private:
     std::string m_configPath;
     bool LoadConfig();
 
+    // Guards every access to m_config.
+    //
+    // LoadConfig() clears and refills m_config.instances, which reallocates
+    // the vector and reassigns its std::strings.  ApplyConfig() is safe (it
+    // holds m_applyMutex and joins the watchdog first), but GetStatus() runs
+    // on an HTTP thread and iterates the same vector -- and UIs poll status,
+    // so a reload landing mid-poll is a use-after-free.
+    //
+    // Held only for the duration of a read or the final swap in LoadConfig(),
+    // and NEVER together with m_pipelineMutex -- GetStatus() snapshots the
+    // config, releases, then takes the pipeline lock.  The two locks are
+    // therefore never held at once and cannot deadlock against each other.
+    std::mutex m_configMutex;
+    OpusRTPConfig GetConfigSnapshot();
+
     // Pipeline watchdog -- polls bus messages and recovers crashed pipelines
     bool PollPipelinesWatchdog();
 
@@ -170,10 +221,43 @@ private:
     std::atomic<bool> m_watchdogRunning{false};
     void WatchdogLoop();
 
+    // Deferred pipeline-rebuild thread -- spawned by WatchdogLoop()'s rebuild
+    // path to call ApplyConfig() from a thread other than the one
+    // ApplyConfig() needs to join (m_watchdogThread).  Tracked as a member
+    // (rather than detached) so Shutdown() can join it before tearing
+    // anything else down -- a detached thread could otherwise call
+    // ApplyConfig() and resurrect pipelines after Shutdown() has already run,
+    // and a detached thread racing Shutdown()'s own join of m_watchdogThread
+    // is undefined behavior.
+    std::thread m_rebuildThread;
+
+    // Serializes the whole tear-down/rebuild sequence in ApplyConfig(),
+    // Shutdown() and Cleanup().  ApplyConfig() joins the watchdog thread at
+    // the top and re-creates it ~50 lines later, after loading config and
+    // building pipelines; that window is wide, and ApplyConfig() has four
+    // independent callers (the boot sequence, OpusRTPApplyCommand::run on a
+    // command thread, OnPipeWireReady(), and m_rebuildThread from the
+    // watchdog).  Two overlapping calls both pass the join, then both assign
+    // m_watchdogThread -- and assigning over a still-joinable std::thread is
+    // an unconditional std::terminate().
+    //
+    // Shutdown() must join m_rebuildThread BEFORE taking this lock: that
+    // thread calls ApplyConfig(), so holding the lock across the join would
+    // deadlock.
+    std::mutex m_applyMutex;
+
     // Pipeline management
     std::map<int, OpusRTPPipeline> m_sendPipelines;
     std::map<int, OpusRTPPipeline> m_recvPipelines;
     std::mutex m_pipelineMutex;
+
+    // Send instances ApplyConfig() chose not to start because nothing feeds
+    // them -- see OpusRTPConfig::requireGroupSource.  Instance ID to the
+    // reason, which is shown to the user, so phrase it as guidance rather than
+    // as an error.  Guarded by m_pipelineMutex alongside the pipeline maps, so
+    // a status reader sees the whole picture -- running, failed and waiting --
+    // under one lock.
+    std::map<int, std::string> m_deferredSenders;
 
     bool CreateSendPipeline(const OpusRTPInstance& inst);
     bool CreateRecvPipeline(const OpusRTPInstance& inst);

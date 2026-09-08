@@ -15,6 +15,8 @@
 #include "Warnings.h" // WarningHolder -- needed directly for NOPCH builds
 #include <cmath>
 
+#include "GStreamerOut.h"
+#include "V4L2Device.h"
 #include "VideoInputManager.h"
 #include "VideoOutputManager.h"
 #include "common.h"
@@ -25,6 +27,10 @@
 #include <sstream>
 
 #include "fpp-json.h"
+
+#ifdef HAS_GSTREAMER_VIDEO_INPUT
+#include <gst/app/gstappsink.h>
+#endif
 
 // pipewiresink mode=provide enum value (GST_PIPEWIRE_SINK_MODE_PROVIDE)
 static constexpr int PIPEWIRE_SINK_MODE_PROVIDE = 2;
@@ -56,6 +62,110 @@ static std::string GstQuote(const std::string& value) {
     }
     out += '"';
     return out;
+}
+
+// Sanitise a URI down to URL-safe characters before it is spliced into a
+// single-quoted shell argument, so nothing in it can close the quote.
+static std::string ShellSafeUri(const std::string& uri) {
+    std::string out;
+    out.reserve(uri.size());
+    for (char c : uri) {
+        if (std::isalnum(static_cast<unsigned char>(c)) || c == ':' || c == '/'
+            || c == '.' || c == '-' || c == '_' || c == '~' || c == '?'
+            || c == '&' || c == '=' || c == '%' || c == '+' || c == '@') {
+            out += c;
+        }
+    }
+    return out;
+}
+
+// What a yt-dlp resolution produced.
+struct YtDlpResult {
+    std::string url;         // empty when resolution failed
+    double fps = 0.0;        // 0 when fps wasn't requested, or didn't parse
+    std::string diagnostics; // yt-dlp's own error text, for the log
+};
+
+// Resolve a page URL to a directly playable stream URL via yt-dlp.
+//
+// stderr used to be sent to /dev/null, which made every failure look identical
+// in the log - "returned no valid URL" - while the reason for it was thrown
+// away. The packaged yt-dlp goes stale against YouTube every few months and
+// then fails with a specific, actionable message ("The page needs to be
+// reloaded", "Sign in to confirm you're not a bot"), so that is the failure
+// operators actually hit and the one the log could least afford to swallow.
+// stderr is folded into the capture and reported instead: yt-dlp's own
+// diagnostics are line-oriented and never begin with "http", so the URL line
+// stays unambiguous among them.
+static YtDlpResult RunYtDlp(const std::string& format, const std::string& uri, bool wantFps) {
+    YtDlpResult res;
+    std::string cmd = "yt-dlp -f '" + format + "' --print url";
+    if (wantFps) {
+        cmd += " --print fps";
+    }
+    cmd += " '" + ShellSafeUri(uri) + "' 2>&1";
+
+    FILE* pipe = popen(cmd.c_str(), "r");
+    if (!pipe) {
+        res.diagnostics = "could not run yt-dlp";
+        return res;
+    }
+    std::string output;
+    char buf[4096];
+    while (fgets(buf, sizeof(buf), pipe)) {
+        output += buf;
+    }
+    // pclose() may return -1 when SA_NOCLDWAIT is set on SIGCHLD (the kernel
+    // auto-reaps the child, so waitpid fails with ECHILD), so the exit status
+    // can't be trusted here - validate the output content instead.
+    pclose(pipe);
+
+    std::istringstream iss(output);
+    std::string line;
+    bool fpsLineNext = false;
+    while (std::getline(iss, line)) {
+        while (!line.empty() && (line.back() == '\n' || line.back() == '\r' || line.back() == ' ')) {
+            line.pop_back();
+        }
+        if (line.empty()) {
+            continue;
+        }
+        if (fpsLineNext) {
+            // --print fps emits the framerate on the line right after the URL.
+            fpsLineNext = false;
+            try {
+                res.fps = std::stod(line);
+            } catch (...) {
+                res.fps = 0.0;
+            }
+        } else if (res.url.empty() && line.rfind("http", 0) == 0) {
+            res.url = line;
+            fpsLineNext = wantFps;
+        } else if (res.url.empty() && res.diagnostics.size() < 400) {
+            if (!res.diagnostics.empty()) {
+                res.diagnostics += " | ";
+            }
+            res.diagnostics += line;
+        }
+    }
+    return res;
+}
+
+// Adopt the stream's native framerate, but never above the configured one -
+// don't push a source to 60fps just because the stream is 60fps natively when
+// the user asked for 30. videorate handles the downsampling.
+static void ApplyDetectedFps(double detectedFps, int& framerate, const char* name) {
+    if (detectedFps < 1.0 || detectedFps > 120.0) {
+        LogInfo(VB_MEDIAOUT, "VideoInputManager: yt-dlp fps not available for '%s', using config %dfps\n",
+                name, framerate);
+        return;
+    }
+    int detected = (int)std::lround(detectedFps);
+    int configFps = framerate;
+    framerate = std::min(detected, configFps);
+    LogInfo(VB_MEDIAOUT, "VideoInputManager: yt-dlp detected %dfps for '%s', "
+            "capped to configured %dfps -> using %dfps\n",
+            detected, name, configFps, framerate);
 }
 
 // Control characters have no representation in the description grammar and
@@ -261,6 +371,20 @@ bool VideoInputManager::LoadConfig() {
             si.pattern = entry.get("pattern", "smpte").asString();
         } else if (si.type == "v4l2src") {
             si.device = entry.get("device", "/dev/video0").asString();
+            si.powerLineFrequency = entry.get("powerLineFrequency", -1).asInt();
+            si.exposureMode = entry.get("exposureMode", "camera").asString();
+            si.exposureTime100us = entry.get("exposureTime100us", -1).asInt();
+            si.dynamicFramerate = entry.get("dynamicFramerate", -1).asInt();
+            if (si.powerLineFrequency < 0 || si.powerLineFrequency > 2)
+                si.powerLineFrequency = -1;
+            if (si.exposureMode != "auto" && si.exposureMode != "manual")
+                si.exposureMode = "camera";
+            if (si.dynamicFramerate < 0 || si.dynamicFramerate > 1)
+                si.dynamicFramerate = -1;
+            // 100us units: 1 .. 1s.  The device's own range is applied on
+            // top of this in V4L2Device::ApplyControls.
+            if (si.exposureTime100us < 1 || si.exposureTime100us > 10000)
+                si.exposureTime100us = -1;
         } else if (si.type == "rtspsrc") {
             si.uri = entry.get("uri", "").asString();
             si.latency = entry.get("latency", 200).asInt();
@@ -302,12 +426,57 @@ bool VideoInputManager::LoadConfig() {
     return !m_sources.empty();
 }
 
+std::string VideoInputManager::BuildDeviceCaps(const SourceInfo& source) {
+    std::vector<V4L2Device::Mode> modes = V4L2Device::EnumerateModes(source.device);
+    if (modes.empty()) {
+        LogInfo(VB_MEDIAOUT, "VideoInputManager: %s enumerated no capture modes, "
+                             "letting the device pick its own\n", source.device.c_str());
+        return "";
+    }
+
+    V4L2Device::Mode chosen;
+    if (!V4L2Device::SelectMode(modes, source.width, source.height, source.framerate, chosen))
+        return "";
+
+    std::string caps = V4L2Device::ModeToCaps(chosen);
+    if (caps.empty()) {
+        LogInfo(VB_MEDIAOUT, "VideoInputManager: %s best mode is %s (no caps mapping), "
+                             "letting the device pick its own\n",
+                source.device.c_str(), chosen.fourcc.c_str());
+        return "";
+    }
+
+    if (chosen.width != source.width || chosen.height != source.height ||
+        chosen.fps() < source.framerate - 0.01) {
+        // Worth saying out loud: this is the difference between what the
+        // operator typed and what the camera can actually deliver, and the
+        // scaler silently papering over it is what made the old behaviour
+        // hard to spot.
+        LogInfo(VB_MEDIAOUT, "VideoInputManager: %s has no %dx%d@%d mode; capturing %s %dx%d@%.3g "
+                             "and converting\n",
+                source.device.c_str(), source.width, source.height, source.framerate,
+                chosen.fourcc.c_str(), chosen.width, chosen.height, chosen.fps());
+    } else {
+        LogInfo(VB_MEDIAOUT, "VideoInputManager: %s capturing %s %dx%d@%.3g\n",
+                source.device.c_str(), chosen.fourcc.c_str(), chosen.width, chosen.height, chosen.fps());
+    }
+
+    return caps;
+}
+
 bool VideoInputManager::StartSource(SourceInfo& source) {
 #ifdef HAS_GSTREAMER_VIDEO_INPUT
     if (source.running) {
         LogWarn(VB_MEDIAOUT, "VideoInputManager: Source '%s' already running\n", source.name.c_str());
         return true;
     }
+
+    // Sources start from Init()/Reload(), which a config change can trigger
+    // before any media has played -- and media playback is what used to be the
+    // only thing that called gst_init().  Without this, gst_parse_launch()
+    // below segfaults inside GStreamer's own parser on a perfectly well-formed
+    // pipeline description.
+    GStreamerOutput::EnsureGStreamerInit();
 
     setenv("PIPEWIRE_RUNTIME_DIR", "/run/pipewire-fpp", 0);
 
@@ -354,9 +523,9 @@ bool VideoInputManager::StartSource(SourceInfo& source) {
         }
         std::string resolvedUri = source.uri;
 
-        // Detect YouTube URLs and resolve to direct HLS via yt-dlp.
-        // YouTube page URLs can't be played by GStreamer directly, and
-        // HLS URLs expire after ~1 hour, so we resolve at start time.
+        // Detect YouTube URLs and resolve to a direct stream URL via yt-dlp.
+        // YouTube page URLs can't be played by GStreamer directly, and the
+        // resolved URLs expire after ~1 hour, so we resolve at start time.
         // When audioEnabled is true for YouTube sources, skip resolution here —
         // StartSourceWithAudio resolves separate video + audio URLs.
         if (!source.audioEnabled &&
@@ -370,70 +539,26 @@ bool VideoInputManager::StartSource(SourceInfo& source) {
             // to what the Pi can actually decode and display.
             std::string ytFmt = "bestvideo[height<=" + std::to_string(source.height)
                 + "][vcodec^=avc1]/worst[vcodec^=avc1]";
-            // Resolve URL and detect native framerate in one call.
-            std::string ytdlpCmd = "yt-dlp -f '" + ytFmt + "' --print url --print fps";
-            // Sanitise URI — only allow URL-safe characters to prevent injection
-            std::string safeUri;
-            for (char c : resolvedUri) {
-                if (std::isalnum(c) || c == ':' || c == '/' || c == '.' || c == '-'
-                    || c == '_' || c == '~' || c == '?' || c == '&' || c == '='
-                    || c == '%' || c == '+' || c == '@') {
-                    safeUri += c;
-                }
+            YtDlpResult yt = RunYtDlp(ytFmt, resolvedUri, true);
+            if (yt.url.empty()) {
+                // Do not fall back to the original page URL. uridecodebin will
+                // happily fetch it, get text/html back, and fail with "Your
+                // GStreamer installation is missing a plug-in ... Missing
+                // decoder: text/html" - which reads like a broken GStreamer
+                // install and sends you looking in entirely the wrong place.
+                // The source cannot start until yt-dlp resolves it, so fail
+                // here and say why.
+                LogErr(VB_MEDIAOUT, "VideoInputManager: yt-dlp could not resolve the URL for '%s': %s\n",
+                       source.name.c_str(),
+                       yt.diagnostics.empty() ? "no output" : yt.diagnostics.c_str());
+                WarningHolder::AddWarning(56, "Video input '" + source.name
+                    + "': yt-dlp could not resolve the YouTube URL - it may need updating");
+                return false;
             }
-            ytdlpCmd += " '" + safeUri + "' 2>/dev/null";
-
-            FILE* pipe = popen(ytdlpCmd.c_str(), "r");
-            if (pipe) {
-                char buf[4096];
-                std::string result;
-                while (fgets(buf, sizeof(buf), pipe)) {
-                    result += buf;
-                }
-                pclose(pipe);
-                // Parse two lines: URL then fps
-                std::istringstream iss(result);
-                std::string urlLine, fpsLine;
-                std::getline(iss, urlLine);
-                std::getline(iss, fpsLine);
-                // Trim whitespace
-                while (!urlLine.empty() && (urlLine.back() == '\n' || urlLine.back() == '\r' || urlLine.back() == ' '))
-                    urlLine.pop_back();
-                while (!fpsLine.empty() && (fpsLine.back() == '\n' || fpsLine.back() == '\r' || fpsLine.back() == ' '))
-                    fpsLine.pop_back();
-                // Note: pclose may return -1 when SA_NOCLDWAIT is set on SIGCHLD
-                // (the kernel auto-reaps the child, so waitpid fails with ECHILD).
-                // Validate the output content instead of relying on the exit code.
-                if (!urlLine.empty() && urlLine.find("http") == 0) {
-                    LogInfo(VB_MEDIAOUT, "VideoInputManager: yt-dlp resolved '%s' → %zu-char HLS URL\n",
-                            source.name.c_str(), urlLine.size());
-                    resolvedUri = urlLine;
-                    // Auto-detect framerate from yt-dlp, but cap to the
-                    // user-configured value — don't override 30fps with 60fps
-                    // just because the stream is 60fps natively.  The videorate
-                    // element handles downsampling.
-                    int configFps = source.framerate;
-                    try {
-                        double detectedFps = std::stod(fpsLine);
-                        if (detectedFps >= 1.0 && detectedFps <= 120.0) {
-                            int detected = (int)std::lround(detectedFps);
-                            source.framerate = std::min(detected, configFps);
-                            LogInfo(VB_MEDIAOUT, "VideoInputManager: yt-dlp detected %dfps for '%s', "
-                                    "capped to configured %dfps → using %dfps\n",
-                                    detected, source.name.c_str(), configFps, source.framerate);
-                        }
-                    } catch (...) {
-                        LogInfo(VB_MEDIAOUT, "VideoInputManager: yt-dlp fps not available for '%s', using config %dfps\n",
-                                source.name.c_str(), source.framerate);
-                    }
-                } else {
-                    LogWarn(VB_MEDIAOUT, "VideoInputManager: yt-dlp returned no valid URL for '%s', "
-                            "using original URI\n", source.name.c_str());
-                }
-            } else {
-                LogWarn(VB_MEDIAOUT, "VideoInputManager: Failed to run yt-dlp for '%s'\n",
-                        source.name.c_str());
-            }
+            LogInfo(VB_MEDIAOUT, "VideoInputManager: yt-dlp resolved '%s' -> %zu-char stream URL\n",
+                    source.name.c_str(), yt.url.size());
+            resolvedUri = yt.url;
+            ApplyDetectedFps(yt.fps, source.framerate, source.name.c_str());
         }
 
         // uridecodebin handles full URI negotiation: HTTP, HLS (.m3u8),
@@ -516,8 +641,16 @@ bool VideoInputManager::StartSource(SourceInfo& source) {
                 source.name.c_str());
     }
 
+    // pixel-aspect-ratio=1/1 is load-bearing.  Forcing width and height
+    // alone lets videoscale hit the requested size by changing the PAR
+    // instead of actually rescaling: a 4:3 camera configured as 1280x720
+    // produced caps of 1280x720 with pixel-aspect-ratio=3/4, i.e. a frame
+    // that still displays 4:3.  Pinning square pixels makes videoscale do
+    // the real work, and its add-borders default letterboxes rather than
+    // distorting when the source and target aspects differ.
     std::string capsStr = "video/x-raw,width=" + std::to_string(source.width)
                         + ",height=" + std::to_string(source.height)
+                        + ",pixel-aspect-ratio=1/1"
                         + ",framerate=" + std::to_string(source.framerate) + "/1";
 
     std::string pipelineDesc;
@@ -545,6 +678,35 @@ bool VideoInputManager::StartSource(SourceInfo& source) {
             + " ! " + capsStr
             + " ! queue max-size-time=2000000000 max-size-buffers=0 max-size-bytes=0"
             + " ! clocksync"
+            + " ! intervideosink sync=false channel=" + GstQuote(source.pipeWireNodeName);
+    } else if (source.type == "v4l2src") {
+        // Cameras only negotiate their own native modes.  Asking v4l2src
+        // directly for video/x-raw at an arbitrary width/height/framerate
+        // fails to negotiate and the pipeline never leaves READY, which
+        // surfaced only as "failed to start" in the log.  decodebin covers
+        // MJPEG-only and H.264 webcams (very common above VGA), and passes
+        // already-raw formats straight through; videoscale/videorate then
+        // convert whatever the camera gave us to the configured size/rate.
+        //
+        // Leaving the device *entirely* unconstrained, though, meant the
+        // configured resolution and framerate never reached it at all:
+        // v4l2src picked the device's own preferred mode (a 1920x1080@30
+        // source was observed capturing 640x480@60) and videoscale/videorate
+        // resampled that to the configured numbers, so the settings looked
+        // applied while the capture ignored them.  BuildDeviceCaps asks the
+        // device what it actually supports and pins the closest real mode,
+        // returning "" -- and so restoring exactly the unconstrained
+        // behaviour above -- whenever it can't be sure.
+        std::string deviceCaps = BuildDeviceCaps(source);
+
+        pipelineDesc = srcElement
+            + (deviceCaps.empty() ? "" : " ! " + deviceCaps)
+            + " ! decodebin"
+            + " ! videoconvert"
+            + " ! videoscale"
+            + " ! videorate"
+            + " ! " + capsStr
+            + " ! queue max-size-buffers=2 leaky=downstream"
             + " ! intervideosink sync=false channel=" + GstQuote(source.pipeWireNodeName);
     } else {
         pipelineDesc = srcElement
@@ -587,9 +749,38 @@ bool VideoInputManager::StartSource(SourceInfo& source) {
     std::atomic<bool>* shutdownFlag = &source.shutdownRequested;
     std::atomic<bool>* runningFlag = &source.running;
 
-    source.runThread = std::thread([pipeline, sourceName, nodeNameCopy, shutdownFlag, runningFlag]() {
+    // Copied by value into the thread rather than reached through `source`:
+    // the run thread outlives this call and m_sources can be reallocated by
+    // a Reload while it is still going.
+    std::string deviceCopy = source.device;
+    V4L2Device::ControlSettings controls;
+    if (source.type == "v4l2src") {
+        controls.powerLineFrequency = source.powerLineFrequency;
+        controls.exposureMode = source.exposureMode;
+        controls.exposureTime100us = source.exposureTime100us;
+        controls.dynamicFramerate = source.dynamicFramerate;
+    }
+
+    source.runThread = std::thread([pipeline, sourceName, nodeNameCopy, shutdownFlag, runningFlag,
+                                    deviceCopy, controls]() {
         LogInfo(VB_MEDIAOUT, "VideoInputManager: Source '%s' thread starting pipeline (node=%s)\n",
                 sourceName.c_str(), nodeNameCopy.c_str());
+
+        // Device controls (anti-flicker / exposure) are applied twice on
+        // purpose: once here so v4l2src inherits them when it opens the
+        // node, and again once the pipeline is actually PLAYING so a driver
+        // that resets on open doesn't undo them.  The writes are idempotent
+        // and cost one ioctl each.
+        auto applyControls = [deviceCopy, controls, sourceName]() {
+            if (!controls.AnyRequested())
+                return;
+            std::string summary;
+            if (V4L2Device::ApplyControls(deviceCopy, controls, summary) && !summary.empty()) {
+                LogInfo(VB_MEDIAOUT, "VideoInputManager: Source '%s' device controls: %s\n",
+                        sourceName.c_str(), summary.c_str());
+            }
+        };
+        applyControls();
 
         GstStateChangeReturn ret = gst_element_set_state(pipeline, GST_STATE_PLAYING);
         if (ret == GST_STATE_CHANGE_FAILURE) {
@@ -608,6 +799,7 @@ bool VideoInputManager::StartSource(SourceInfo& source) {
 
         // If pipeline went straight to PLAYING (no async), notify consumers now.
         if (ret == GST_STATE_CHANGE_SUCCESS) {
+            applyControls();
             VideoOutputManager::Instance().NotifyProducerReady(nodeNameCopy);
         }
 
@@ -664,6 +856,7 @@ bool VideoInputManager::StartSource(SourceInfo& source) {
                                 gst_element_state_get_name(newState),
                                 gst_element_state_get_name(pending));
                         if (newState == GST_STATE_PLAYING && pending == GST_STATE_VOID_PENDING) {
+                            applyControls();
                             VideoOutputManager::Instance().NotifyProducerReady(nodeNameCopy);
                         }
                     }
@@ -704,6 +897,7 @@ bool VideoInputManager::StartSource(SourceInfo& source) {
 // ─── Start source with separate video + audio streams (YouTube HLS) ───────
 bool VideoInputManager::StartSourceWithAudio(SourceInfo& source) {
 #ifdef HAS_GSTREAMER_VIDEO_INPUT
+    GStreamerOutput::EnsureGStreamerInit();
     if (source.running) {
         LogWarn(VB_MEDIAOUT, "VideoInputManager: Source '%s' already running\n", source.name.c_str());
         return true;
@@ -718,68 +912,25 @@ bool VideoInputManager::StartSourceWithAudio(SourceInfo& source) {
     // downloads, so we resolve separate video-only and audio-only URLs
     // and use two independent uridecodebin elements.
 
-    // Sanitise URI — only allow URL-safe characters to prevent injection
-    std::string safeUri;
-    for (char c : source.uri) {
-        if (std::isalnum(c) || c == ':' || c == '/' || c == '.' || c == '-'
-            || c == '_' || c == '~' || c == '?' || c == '&' || c == '='
-            || c == '%' || c == '+' || c == '@') {
-            safeUri += c;
-        }
-    }
-
     // Resolve video-only URL and detect native framerate
     std::string videoUrl;
     {
         // Select best H.264 stream fitting the configured height
         std::string ytFmt = "bestvideo[height<=" + std::to_string(source.height)
             + "][vcodec^=avc1]/worst[vcodec^=avc1]";
-        std::string cmd = "yt-dlp -f '" + ytFmt + "' --print url --print fps '" + safeUri + "' 2>/dev/null";
         LogInfo(VB_MEDIAOUT, "VideoInputManager: Resolving YouTube video URL for '%s'\n",
                 source.name.c_str());
-        FILE* pipe = popen(cmd.c_str(), "r");
-        if (pipe) {
-            char buf[4096];
-            std::string result;
-            while (fgets(buf, sizeof(buf), pipe))
-                result += buf;
-            pclose(pipe);
-            // Parse two lines: URL then fps
-            std::istringstream iss(result);
-            std::string urlLine, fpsLine;
-            std::getline(iss, urlLine);
-            std::getline(iss, fpsLine);
-            while (!urlLine.empty() && (urlLine.back() == '\n' || urlLine.back() == '\r' || urlLine.back() == ' '))
-                urlLine.pop_back();
-            while (!fpsLine.empty() && (fpsLine.back() == '\n' || fpsLine.back() == '\r' || fpsLine.back() == ' '))
-                fpsLine.pop_back();
-            if (!urlLine.empty() && urlLine.find("http") == 0) {
-                videoUrl = urlLine;
-                LogInfo(VB_MEDIAOUT, "VideoInputManager: Video URL resolved (%zu chars)\n", videoUrl.size());
-                // Auto-detect framerate from yt-dlp, but cap to the
-                // user-configured value (same rationale as combined path).
-                int configFps = source.framerate;
-                try {
-                    double detectedFps = std::stod(fpsLine);
-                    if (detectedFps >= 1.0 && detectedFps <= 120.0) {
-                        int detected = (int)std::lround(detectedFps);
-                        source.framerate = std::min(detected, configFps);
-                        LogInfo(VB_MEDIAOUT, "VideoInputManager: yt-dlp detected %dfps for '%s', "
-                                "capped to configured %dfps → using %dfps\n",
-                                detected, source.name.c_str(), configFps, source.framerate);
-                    }
-                } catch (...) {
-                    LogInfo(VB_MEDIAOUT, "VideoInputManager: yt-dlp fps not available, using config %dfps\n",
-                            source.framerate);
-                }
-            }
+        YtDlpResult yt = RunYtDlp(ytFmt, source.uri, true);
+        if (yt.url.empty()) {
+            LogWarn(VB_MEDIAOUT, "VideoInputManager: Failed to resolve video URL for '%s': %s\n",
+                    source.name.c_str(),
+                    yt.diagnostics.empty() ? "no output" : yt.diagnostics.c_str());
+            WarningHolder::AddWarning(56, "Video input '" + source.name + "': could not resolve the video URL");
+            return false;
         }
-    }
-    if (videoUrl.empty()) {
-        LogWarn(VB_MEDIAOUT, "VideoInputManager: Failed to resolve video URL for '%s'\n",
-                source.name.c_str());
-        WarningHolder::AddWarning(56, "Video input '" + source.name + "': could not resolve the video URL");
-        return false;
+        videoUrl = yt.url;
+        LogInfo(VB_MEDIAOUT, "VideoInputManager: Video URL resolved (%zu chars)\n", videoUrl.size());
+        ApplyDetectedFps(yt.fps, source.framerate, source.name.c_str());
     }
 
     // Resolve audio-only URL
@@ -787,32 +938,20 @@ bool VideoInputManager::StartSourceWithAudio(SourceInfo& source) {
     {
         // 234 = high quality HLS audio, 233 = low quality HLS audio
         // 140 = AAC 128k from DASH (non-live fallback), 139 = HE-AAC 48k
-        std::string ytFmt = "234/233/140/139/bestaudio";
-        std::string cmd = "yt-dlp -f '" + ytFmt + "' -g '" + safeUri + "' 2>/dev/null";
         LogInfo(VB_MEDIAOUT, "VideoInputManager: Resolving YouTube audio URL for '%s'\n",
                 source.name.c_str());
-        FILE* pipe = popen(cmd.c_str(), "r");
-        if (pipe) {
-            char buf[4096];
-            std::string result;
-            while (fgets(buf, sizeof(buf), pipe))
-                result += buf;
-            pclose(pipe);
-            while (!result.empty() && (result.back() == '\n' || result.back() == '\r' || result.back() == ' '))
-                result.pop_back();
-            if (!result.empty() && result.find("http") == 0) {
-                audioUrl = result;
-                LogInfo(VB_MEDIAOUT, "VideoInputManager: Audio URL resolved (%zu chars)\n", audioUrl.size());
-            }
+        YtDlpResult yt = RunYtDlp("234/233/140/139/bestaudio", source.uri, false);
+        if (yt.url.empty()) {
+            LogWarn(VB_MEDIAOUT, "VideoInputManager: Failed to resolve audio URL for '%s' (%s), "
+                    "falling back to video-only\n", source.name.c_str(),
+                    yt.diagnostics.empty() ? "no output" : yt.diagnostics.c_str());
+            // Returning false here is not a no-op: our caller (StartSource())
+            // retries with audioEnabled cleared and builds the regular
+            // video-only pipeline instead of leaving the source unstarted.
+            return false;
         }
-    }
-    if (audioUrl.empty()) {
-        LogWarn(VB_MEDIAOUT, "VideoInputManager: Failed to resolve audio URL for '%s', "
-                "falling back to video-only\n", source.name.c_str());
-        // Returning false here is not a no-op: our caller (StartSource())
-        // retries with audioEnabled cleared and builds the regular
-        // video-only pipeline instead of leaving the source unstarted.
-        return false;
+        audioUrl = yt.url;
+        LogInfo(VB_MEDIAOUT, "VideoInputManager: Audio URL resolved (%zu chars)\n", audioUrl.size());
     }
 
     // Build a SINGLE combined pipeline for video and audio.
@@ -820,8 +959,16 @@ bool VideoInputManager::StartSourceWithAudio(SourceInfo& source) {
     // A/V drift that occurs when separate pipelines pace independently.
     // (intervideosink + pipewiresink in one pipeline works fine;
     // the original deadlock was two pipewiresinks in provide mode.)
+    // pixel-aspect-ratio=1/1 is load-bearing.  Forcing width and height
+    // alone lets videoscale hit the requested size by changing the PAR
+    // instead of actually rescaling: a 4:3 camera configured as 1280x720
+    // produced caps of 1280x720 with pixel-aspect-ratio=3/4, i.e. a frame
+    // that still displays 4:3.  Pinning square pixels makes videoscale do
+    // the real work, and its add-borders default letterboxes rather than
+    // distorting when the source and target aspects differ.
     std::string capsStr = "video/x-raw,width=" + std::to_string(source.width)
                         + ",height=" + std::to_string(source.height)
+                        + ",pixel-aspect-ratio=1/1"
                         + ",framerate=" + std::to_string(source.framerate) + "/1";
 
     // Convert bufferSec to nanoseconds for GStreamer properties.
@@ -1159,4 +1306,120 @@ void VideoInputManager::JoinTeardownThreads() {
             t.join();
         }
     }
+}
+
+
+bool VideoInputManager::GrabSnapshotJPEG(int sourceId, int maxWidth, int timeoutMs,
+                                         std::vector<uint8_t>& jpegOut) {
+    jpegOut.clear();
+#ifdef HAS_GSTREAMER_VIDEO_INPUT
+    if (maxWidth < 32) maxWidth = 32;
+    if (maxWidth > 1280) maxWidth = 1280;
+    if (timeoutMs < 100) timeoutMs = 100;
+    if (timeoutMs > 10000) timeoutMs = 10000;
+
+    GStreamerOutput::EnsureGStreamerInit();
+
+    std::string channel;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        for (const auto& src : m_sources) {
+            if (src.id == sourceId) {
+                if (!src.running.load()) {
+                    return false;
+                }
+                channel = src.pipeWireNodeName;
+                break;
+            }
+        }
+    }
+    if (channel.empty() || !GstValueUsable(channel, "node name", "snapshot")) {
+        return false;
+    }
+
+    // pixel-aspect-ratio=1/1 is load-bearing.  With a width-only capsfilter
+    // videoscale satisfies the request by changing the PAR rather than the
+    // height -- a 240x135 source came out as a 320x135 JPEG, and since JPEG
+    // carries no PAR the preview showed a squashed picture.  Pinning PAR to
+    // square forces videoscale to pick the height instead, so the preview
+    // has the same shape as the real output.
+    std::string desc = "intervideosrc name=isrc timeout=" + std::to_string((long long)timeoutMs * 1000000LL)
+                     + " channel=" + GstQuote(channel)
+                     + " ! videoconvert"
+                     + " ! videoscale"
+                     + " ! video/x-raw,width=" + std::to_string(maxWidth)
+                     + ",pixel-aspect-ratio=1/1"
+                     + " ! jpegenc quality=70"
+                     + " ! appsink name=snap max-buffers=1 drop=true sync=false";
+
+    GError* error = nullptr;
+    GstElement* pipeline = gst_parse_launch(desc.c_str(), &error);
+    if (!pipeline) {
+        LogWarn(VB_MEDIAOUT, "VideoInputManager: snapshot pipeline failed for source %d: %s\n",
+                sourceId, error ? error->message : "unknown error");
+        if (error) g_error_free(error);
+        return false;
+    }
+    if (error) {
+        g_error_free(error);
+        error = nullptr;
+    }
+
+    GstElement* sink = gst_bin_get_by_name(GST_BIN(pipeline), "snap");
+    if (!sink) {
+        gst_element_set_state(pipeline, GST_STATE_NULL);
+        gst_object_unref(pipeline);
+        return false;
+    }
+
+    bool ok = false;
+    if (gst_element_set_state(pipeline, GST_STATE_PLAYING) != GST_STATE_CHANGE_FAILURE) {
+        GstSample* sample = gst_app_sink_try_pull_sample(
+            GST_APP_SINK(sink), (GstClockTime)timeoutMs * GST_MSECOND);
+        if (sample) {
+            GstBuffer* buf = gst_sample_get_buffer(sample);
+            GstMapInfo map;
+            if (buf && gst_buffer_map(buf, &map, GST_MAP_READ)) {
+                jpegOut.assign(map.data, map.data + map.size);
+                gst_buffer_unmap(buf, &map);
+                ok = !jpegOut.empty();
+            }
+            gst_sample_unref(sample);
+
+            // Log what intervideosrc actually negotiated off the shared
+            // surface, now that a frame has arrived and caps are fixed.
+            // This is the only in-process view of the channel's real caps:
+            // an out-of-process gst-launch probe can never see it, because
+            // the inter elements share a surface registry private to one
+            // process and would report the element default (320x240) and
+            // emit black frames instead.
+            GstElement* isrc = gst_bin_get_by_name(GST_BIN(pipeline), "isrc");
+            if (isrc) {
+                GstPad* pad = gst_element_get_static_pad(isrc, "src");
+                if (pad) {
+                    GstCaps* c = gst_pad_get_current_caps(pad);
+                    if (c) {
+                        gchar* cs = gst_caps_to_string(c);
+                        LogDebug(VB_MEDIAOUT, "VideoInputManager: channel '%s' negotiated caps: %s\n",
+                                 channel.c_str(), cs ? cs : "?");
+                        g_free(cs);
+                        gst_caps_unref(c);
+                    }
+                    gst_object_unref(pad);
+                }
+                gst_object_unref(isrc);
+            }
+        } else {
+            LogDebug(VB_MEDIAOUT, "VideoInputManager: snapshot timed out for source %d (no frames on channel %s)\n",
+                     sourceId, channel.c_str());
+        }
+    }
+
+    gst_element_set_state(pipeline, GST_STATE_NULL);
+    gst_object_unref(sink);
+    gst_object_unref(pipeline);
+    return ok;
+#else
+    return false;
+#endif
 }

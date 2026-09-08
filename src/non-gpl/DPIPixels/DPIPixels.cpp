@@ -48,6 +48,41 @@
 
 #define POSITION_TO_BITMASK(x) (0x000001 << (x))
 
+// Blank scanlines at the top of every frame, before the first WS bit.  The
+// very first FB pixel of a frame is the first third of channel 0's MSB, i.e.
+// the first pixel's red MSB, and it is emitted at the moment the scan-out
+// pipeline restarts after vertical blanking (display list reload, DMA/FIFO
+// priming).  Any stretch of that first high period there reads as a 1 on
+// pixels with a tight T0H threshold: a red first pixel.  Starting the frame
+// with fully low lines moves the pipeline start-up into the reset gap where
+// it cannot matter.  Costs ~50us of low per row, which only lengthens reset.
+constexpr int DPI_LEAD_ROWS = 2;
+
+// FB pixels the non-latched WS bit stays high before its data section, i.e.
+// the 0-bit high time in 26ns steps.  The bit cell is 48 px: this many high,
+// then 16 px of data (high for a 1) written by PrepData(), then low.  12 gives
+// T0H 312ns / T1H 729ns, which is what FPP's PRU string drivers have shipped
+// for years (320/750) and sits inside every datasheet window: WS2811 wants a
+// 0-bit high of 100-400ns, SK6812/WS2815 150-450, WS2812B 250-550.  The old
+// even thirds gave 417ns, outside the WS2811 window, and the first pixel on a
+// string of older WS2811 parts (the only one that sees the Pi's raw edge,
+// every later pixel gets a regenerated one) would randomly read 0 bits as 1.
+// The latched layout keeps its 16/16/16 thirds: its 4-latch pulse train needs
+// the 16 px phases.
+constexpr int DPI_T0H_PX = 12;
+
+// Latched outputs get the same 312/729ns cell when the cape uses at most
+// three latch banks.  A phase is one 4 px slot per bank (set data, LE high for
+// 2 px, hold), so with L banks the "go high" slots occupy px 0..4L-1 and the
+// "go to data" slots can start at px 12 and the "go low" slots at px 28 for
+// L <= 3 without overlapping.  Each bank's LE fires at the same offset within
+// its phase, so every bank sees T0H = 12 px and T1H = 28 px exactly.  Four
+// banks need the full 16 px phases (16/16/16, T0H 417ns) because the fourth
+// "go high" slot sits at px 12..15.  The LE pulse, setup and hold are the same
+// in both layouts.
+inline int latchDataPhasePx(int latchCount) { return latchCount <= 3 ? 12 : 16; }
+inline int latchLowPhasePx(int latchCount) { return latchCount <= 3 ? 28 : 32; }
+
 // Uncomment to log elapsed time in PrepData()
 // #define LOG_ELAPSED_TIME
 // Uncomment to enable the HSync (P1-5) and VSync (P1-3) pins for logic analyzing
@@ -149,6 +184,8 @@ DPIPixelsOutput::DPIPixelsOutput(unsigned int startChannel, unsigned int channel
 
 DPIPixelsOutput::~DPIPixelsOutput() {
     LogDebug(VB_CHANNELOUT, "DPIPixelsOutput::~DPIPixelsOutput()\n");
+    // Idempotent; Close() normally did this, but the listener captures this.
+    unregisterSettingsListener("DPIPixels", "E131BridgingInterval");
 
     if (!m_configuredDPIPins.empty()) {
         for (const auto& pinName : m_configuredDPIPins) {
@@ -167,6 +204,9 @@ DPIPixelsOutput::~DPIPixelsOutput() {
 
     if (onOffMap)
         free(onOffMap);
+
+    if (m_shadow)
+        free(m_shadow);
 
     if (fb)
         delete fb;
@@ -486,7 +526,7 @@ int DPIPixelsOutput::Init(Json::Value config) {
     constexpr int DPI_MAX_CHANNELS = 4800;    // onOffMask[][4800] limit (1600 pixels)
     int cappedChannels = std::min(longestString, DPI_MAX_CHANNELS);
     int dataRows = (cappedChannels + DPI_CHANNELS_PER_ROW - 1) / DPI_CHANNELS_PER_ROW;
-    int neededRows = dataRows + DPI_RESET_ROWS;
+    int neededRows = DPI_LEAD_ROWS + dataRows + DPI_RESET_ROWS;
 
     Json::Value fbConfig;
     // Width 0 => use the connector's (1920) width.  Height is our computed row
@@ -537,13 +577,40 @@ int DPIPixelsOutput::Init(Json::Value config) {
 
     LogDebug(VB_CHANNELOUT, "The framebuffer device %s was opened successfully.\n", device.c_str());
 
+    m_shadow = (uint8_t*)calloc(1, fb->PageSize());
+    if (!m_shadow) {
+        LogErr(VB_CHANNELOUT, "DPIPixels: could not allocate %d bytes for the shadow page\n", fb->PageSize());
+        WarningHolder::AddWarning(13, "DPIPixels: could not allocate the shadow page");
+        return 0;
+    }
+    m_shadowCopyBytes = std::min(fb->PageSize(), (DPI_LEAD_ROWS + dataRows) * fb->RowStride());
+
     // Highest refresh rate this string length allows.  KMS starts the display at
     // that rate (minimal blanking); the actual rate is lowered per-sequence to
     // min(sequenceRate, m_configuredMaxFps) in PrepData().
     m_configuredMaxFps = fb->GetMaxRefreshRate();
     m_currentFps = m_configuredMaxFps;
-    LogInfo(VB_CHANNELOUT, "DPIPixels: framebuffer %dx%d, max refresh %d fps for %d channel longest string\n",
-            fb->Width(), fb->Height(), m_configuredMaxFps, longestString);
+    LogInfo(VB_CHANNELOUT, "DPIPixels: framebuffer %dx%d, max refresh %d fps for %d channel longest string, %s\n",
+            fb->Width(), fb->Height(), m_configuredMaxFps, longestString,
+            usingLatches ? (std::to_string(latchCount) + " latch banks").c_str() : "no latches");
+
+    // Don't leave the display at that maximum.  PrepData() only retimes the
+    // output once something drives it, and a remote (or otherwise idle) box
+    // may sit for hours with nothing doing so, rescanning the string at
+    // hundreds of Hz from boot.  Start at the idle rate PrepData() would pick.
+    // The idle rate follows the E1.31 bridging interval; cache it behind a
+    // settings listener rather than reading the settings map every frame.
+    m_idleFps = IdleFpsFromSetting();
+    registerSettingsListener("DPIPixels", "E131BridgingInterval", [this](const std::string&) {
+        m_idleFps = IdleFpsFromSetting();
+    });
+    if (m_configuredMaxFps > 0) {
+        int startFps = std::clamp(m_idleFps, 1, m_configuredMaxFps);
+        if (startFps != m_currentFps && fb->SetRefreshRate(startFps)) {
+            LogInfo(VB_CHANNELOUT, "DPIPixels: DPI refresh -> %d fps (startup, max %d)\n", startFps, m_configuredMaxFps);
+            m_currentFps = startFps;
+        }
+    }
 
     bool initOK = false;
     if (protocol == "ws2811") {
@@ -562,11 +629,8 @@ int DPIPixelsOutput::Init(Json::Value config) {
     // This prevents garbage/flash when pins start outputting
     if (protocol == "ws2811") {
         std::vector<unsigned char> blankData(FPPD_MAX_CHANNELS, 0);
-
-        for (int page = 0; page < fb->PageCount(); page++) {
-            fbPage = page;
-            PrepData(blankData.data());
-        }
+        PrepData(blankData.data());
+        CopyShadowToAllPages();
         fbPage = 0;
     }
 
@@ -595,8 +659,14 @@ int DPIPixelsOutput::Init(Json::Value config) {
     return ChannelOutput::Init(config);
 }
 
+int DPIPixelsOutput::IdleFpsFromSetting() {
+    int intervalMS = getSettingInt("E131BridgingInterval", 50);
+    return intervalMS > 0 ? std::max(1, (int)std::lround(1000.0 / intervalMS)) : 20;
+}
+
 int DPIPixelsOutput::Close(void) {
     LogDebug(VB_CHANNELOUT, "DPIPixelsOutput::Close()\n");
+    unregisterSettingsListener("DPIPixels", "E131BridgingInterval");
 
     // Stop runtime rate control so the blanking PrepData() calls below don't
     // trigger a modeset while we're tearing down.
@@ -605,15 +675,18 @@ int DPIPixelsOutput::Close(void) {
     // Send blank WS281x data to clear latched pixels before shutdown
     if (fb && pixelStrings.size() > 0 && protocol == "ws2811") {
         std::vector<unsigned char> blankData(FPPD_MAX_CHANNELS, 0);
-
-        for (int page = 0; page < fb->PageCount(); page++) {
-            fbPage = page;
-            PrepData(blankData.data());
-        }
+        PrepData(blankData.data());
+        // Deliberately write both pages, the live one included: at shutdown
+        // there is no flip coming, so the blank reaches the wire only by
+        // overwriting whatever the DPI is scanning.  Tearing is harmless here
+        // (both halves of a torn frame are dark or about to be), and this is
+        // the one place the "never write the page being scanned" rule is
+        // waived - see CopyShadowToAllPages().  Then wait two full scans at
+        // the live rate so the last frame out is entirely the blank one.
+        CopyShadowToAllPages();
         fbPage = 0;
-
-        fb->SyncDisplay(false);
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        int periodMS = m_currentFps > 0 ? (1000 / m_currentFps) : 50;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2 * periodMS + 10));
     }
 
     // Reconfigure DPI pins back to GPIO input
@@ -668,20 +741,16 @@ void DPIPixelsOutput::PrepData(unsigned char* channelData) {
     // longest string physically allows.  A change only happens when a sequence
     // with a different frame rate starts, so the (brief) modeset is rare.
     //
-    // With no sequence running, the rate this follows is whatever the last
-    // sequence left behind -- nothing in core lowers or restores it -- or the
-    // 20fps default at boot.  That pinned live control (pixel overlays, effects,
-    // a lighting desk driving overlays) to a 50ms vblank, so a colour change
-    // waited up to a full frame to reach the string on top of the output
-    // thread's own period.  Running fast while idle costs nothing: SetRefreshRate
-    // only shortens vertical blanking, so the pixel clock and the WS bit timing
-    // are untouched and the string is simply rescanned more often.
-    //
-    // Only raise after a settle window, though.  A rate change is a full
-    // drmModeSetCrtc that drains the pending flip and restarts the vblank
-    // stream, so bouncing on the brief gaps between playlist items would glitch
-    // the output every time.  Dropping back to a sequence's rate stays immediate
-    // -- that direction has to track the data.
+    // With no sequence running, the output thread runs at the E1.31 bridging
+    // interval (overlays, effects, bridge data, test mode), so after a settle
+    // window the DPI is retimed to that rate rather than left at whatever the
+    // last sequence used.  Only change after the settle window, though: a rate
+    // change is a full drmModeSetCrtc that drains the pending flip and restarts
+    // the vblank stream (cutting the WS stream mid-frame), so bouncing on the
+    // brief gaps between playlist items would glitch the output every time.
+    // Tracking a sequence's rate stays immediate -- that has to follow the data.
+    // A current rate that is an exact multiple of the wanted one is kept,
+    // so the common 20/40 fps mix never modesets at all.
     if (m_initialized && m_configuredMaxFps > 0) {
         constexpr long long IDLE_SETTLE_US = 3000000;
 
@@ -695,7 +764,11 @@ void DPIPixelsOutput::PrepData(unsigned char* channelData) {
                 m_idleSinceUS = now;
             }
             if ((now - m_idleSinceUS) >= IDLE_SETTLE_US) {
-                target = m_configuredMaxFps;
+                // With no sequence running the output thread produces frames
+                // at the E1.31 bridging interval, so that is the rate to scan
+                // at; anything faster only rescans the same page.  A current
+                // rate that is an exact multiple of it is kept below.
+                target = m_idleFps;
             }
         }
         if (target < 1) {
@@ -703,6 +776,13 @@ void DPIPixelsOutput::PrepData(unsigned char* channelData) {
         }
         if (target > m_configuredMaxFps) {
             target = m_configuredMaxFps;
+        }
+        // A refresh that is an exact multiple of the wanted rate is as good as
+        // the wanted rate: each frame is just scanned N times and the flip
+        // still lands on a vblank.  Keep it and skip the modeset, which cuts
+        // the DPI stream mid-frame every time it runs.
+        if (m_currentFps > target && (m_currentFps % target) == 0) {
+            target = m_currentFps;
         }
         if (target != m_currentFps && fb->SetRefreshRate(target)) {
             LogInfo(VB_CHANNELOUT, "DPIPixels: DPI refresh -> %d fps (%s, sequence rate %.1f, max %d)\n",
@@ -755,9 +835,11 @@ void DPIPixelsOutput::PrepData(unsigned char* channelData) {
         }
     }
 
-    // Start at front of page but skip the first third of the WS bit
-    // which is already populated and doesn't change
-    protoDest = fb->BufferPage(fbPage) + (fbPixelMult * fb->BytesPerPixel());
+    // Start at the first data row of the shadow page (after the blank lead
+    // rows) but skip the first third of the WS bit which is already populated
+    // and doesn't change
+    protoDest = m_shadow + (DPI_LEAD_ROWS * fb->RowStride()) +
+                ((usingLatches ? latchDataPhasePx(latchCount) : DPI_T0H_PX) * fb->BytesPerPixel());
 
     uint32_t dataIn[MAX_DPI_PIXEL_LATCHES][32];
     uint32_t dataOut[MAX_DPI_PIXEL_LATCHES][32];
@@ -844,7 +926,23 @@ void DPIPixelsOutput::PrepData(unsigned char* channelData) {
 #endif
 }
 
+// Writes every page, including the one currently being scanned.  Only valid
+// while the pins are not yet live (Init, template build) or when a torn frame
+// is acceptable (the shutdown blank in Close()).  Do not add WaitForPageFree()
+// here: SendData() is the per-frame path and already waits for the free page.
+void DPIPixelsOutput::CopyShadowToAllPages() {
+    for (int page = 0; page < fb->PageCount(); page++) {
+        memcpy(fb->BufferPage(page), m_shadow, m_shadowCopyBytes);
+    }
+}
+
 int DPIPixelsOutput::SendData(unsigned char* channelData) {
+    if (fbPage >= 0) {
+        // The page PrepData() targeted was being scanned out until the
+        // previous flip retired; make sure it has before overwriting it.
+        fb->WaitForPageFree();
+        memcpy(fb->BufferPage(fbPage), m_shadow, m_shadowCopyBytes);
+    }
 #ifdef USE_AUTO_SYNC
     if (fbPage >= 0) {
         // LogInfo(VB_CHANNELOUT, "%d - SendData() marking page dirty\n", fbPage);
@@ -962,6 +1060,7 @@ bool DPIPixelsOutput::InitializeWS281x(void) {
     uint32_t pinsOn[MAX_DPI_PIXEL_LATCHES];
 
     fb->ClearAllPages();
+    memset(m_shadow, 0, fb->PageSize());
 
     // 16 FB pixels per third of WS bit gives us room to turn on/off 4 sets of latches
     fbPixelMult = 16; // @ 38.4Mhz, 1920 FB width
@@ -971,8 +1070,10 @@ bool DPIPixelsOutput::InitializeWS281x(void) {
     // Each WS bit is split into three chunks of fbPixelMult FB pixels
     protoBitsPerLine = fb->Width() / (3 * fbPixelMult);
 
-    // Initialize to first FB pixel
-    protoDest = fb->BufferPage(0);
+    // Build the static template in the shadow page; it is copied to the
+    // (uncached) KMS pages below and only its middle thirds change afterwards.
+    // The lead rows stay all-zero so the frame starts with a fully low line.
+    protoDest = m_shadow + (DPI_LEAD_ROWS * fb->RowStride());
 
     // Skip over the hsync/porch pad area
     protoDestExtra = fb->RowPadding();
@@ -1008,35 +1109,35 @@ bool DPIPixelsOutput::InitializeWS281x(void) {
                 }
             }
 
-            // Populate 8 bits for each channel
+            // Populate 8 bits for each channel.  Each WS bit is a 48 px cell
+            // holding three phases of latch pulses; where the data and low
+            // phases start depends on the bank count (see latchDataPhasePx).
+            const int bitBytes = fbPixelMult * 3 * fb->BytesPerPixel();
+            const int dataPhaseBytes = latchDataPhasePx(latchCount) * fb->BytesPerPixel();
+            const int lowPhaseBytes = latchLowPhasePx(latchCount) * fb->BytesPerPixel();
             for (int b = 0; b < 8; b++) {
-                // Setup FB pixels for first third of WS bit.  These will not be modified later.
+                uint8_t* bitStart = protoDest;
+
+                // "Go high" phase at the start of the cell.  Never modified later.
                 // Stays high whether WS bit is a 0 or 1.
-                for (int lp = 0; lp < MAX_DPI_PIXEL_LATCHES; lp++) {
-                    if (lp < latchCount)
-                        WriteLatchedDataAtPosition(protoDest, pinsOn[lp], latchPinMasks[lp]);
-                    else
-                        protoDest += 4 * fb->BytesPerPixel();
+                for (int lp = 0; lp < latchCount; lp++) {
+                    WriteLatchedDataAtPosition(protoDest, pinsOn[lp], latchPinMasks[lp]);
                 }
 
-                // Setup FB pixels for middle third of WS bit
-                // Set Low or High depending on whether WS bit is a 0 or 1.  Set to low initially.
-                for (int lp = 0; lp < MAX_DPI_PIXEL_LATCHES; lp++) {
-                    if (lp < latchCount)
-                        WriteLatchedDataAtPosition(protoDest, 0x000000, latchPinMasks[lp]);
-                    else
-                        protoDest += 4 * fb->BytesPerPixel();
+                // "Go to data" phase: low or high depending on whether the WS
+                // bit is a 0 or 1.  Set to low initially; PrepData() rewrites it.
+                protoDest = bitStart + dataPhaseBytes;
+                for (int lp = 0; lp < latchCount; lp++) {
+                    WriteLatchedDataAtPosition(protoDest, 0x000000, latchPinMasks[lp]);
                 }
 
-                // Setup FB pixels for last third of WS bit.  These will not be modified later.
-                // Stays low whether WS bit is a 0 or 1.
-                for (int lp = 0; lp < MAX_DPI_PIXEL_LATCHES; lp++) {
-                    if (lp < latchCount)
-                        WriteLatchedDataAtPosition(protoDest, 0x000000, latchPinMasks[lp]);
-                    else
-                        protoDest += 4 * fb->BytesPerPixel();
+                // "Go low" phase.  Never modified later.
+                protoDest = bitStart + lowPhaseBytes;
+                for (int lp = 0; lp < latchCount; lp++) {
+                    WriteLatchedDataAtPosition(protoDest, 0x000000, latchPinMasks[lp]);
                 }
 
+                protoDest = bitStart + bitBytes;
                 protoBitOnLine++;
 
                 if (protoBitOnLine >= protoBitsPerLine) {
@@ -1068,18 +1169,18 @@ bool DPIPixelsOutput::InitializeWS281x(void) {
                         onOff = 0xFFFFFF;
                     }
 
-                    // Update FB pixels making up the first third of the WS bit.
-                    // These FB pixel will never be modified again.
-                    for (int i = 0; i < fbPixelMult; i++) {
+                    // Update the FB pixels making up the leading high of the WS
+                    // bit (T0H).  These FB pixels will never be modified again.
+                    for (int i = 0; i < DPI_T0H_PX; i++) {
                         *(protoDest++) = (onOff >> 16);
                         *(protoDest++) = (onOff >> 8);
                         *(protoDest++) = (onOff);
                     }
 
-                    // Skip over the last two-thirds of the current WS bit.
-                    // The middle third will get updated by in PrepData() later
-                    // and the last two-thirds is always 0x000000 for the low.
-                    protoDest += fb->BytesPerPixel() * fbPixelMult * 2;
+                    // Skip over the rest of the current WS bit.  The 16 px data
+                    // section right after the leading high gets updated in
+                    // PrepData() later and the remainder is always 0x000000.
+                    protoDest += fb->BytesPerPixel() * (fbPixelMult * 3 - DPI_T0H_PX);
                 }
 
                 y++;
@@ -1105,10 +1206,7 @@ bool DPIPixelsOutput::InitializeWS281x(void) {
     LogInfo(VB_CHANNELOUT, "InitializeWS2811 Elapsed: %lld\n", elapsed);
 #endif
 
-    for (int p = 1; p < fb->PageCount(); p++) {
-        // Copy first page to rest of pages
-        memcpy(fb->BufferPage(p), fb->BufferPage(0), fb->PageSize());
-    }
+    CopyShadowToAllPages();
 
     fb->SyncDisplay(true);
     fb->NextPage();

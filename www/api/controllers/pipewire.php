@@ -18,6 +18,104 @@
 require_once '../commandsocket.php';
 
 /////////////////////////////////////////////////////////////////////////////
+// Helper: the request body for a volume setter.
+// Normally these are reached as HTTP routes and read php://input, but they are
+// also called directly (with an explicit body) by SystemSetAudio() in
+// system.php when /api/system/volume is given a "target" -- that keeps all the
+// group/member/input-group/routing node resolution in one place here rather
+// than duplicating it there.
+function pw_volume_body($override = null)
+{
+    if (is_array($override)) {
+        return $override;
+    }
+    return json_decode(file_get_contents('php://input'), true);
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// Helper: the internal streams a combine-stream creates for its targets.
+//
+// A routing path (input group -> output group) has no node of its own: it is
+// the stream the input group's combine-stream creates towards that output
+// group's sink, and that stream is where the path's level lives.
+// module-combine-stream names those "output.<combine>_<target>"; earlier
+// builds used "<combine>.<target>", so both are accepted, and the target is
+// confirmed from node.target/target.object rather than trusted to the name.
+//
+// Returns array(nodeId => channelCount) for every matching stream.
+function pw_find_combine_streams($objects, $combineNodeName, $targetNodeName)
+{
+    $found = array();
+    if (!is_array($objects) || $combineNodeName === '' || $targetNodeName === '')
+        return $found;
+
+    foreach ($objects as $obj) {
+        if (!isset($obj['type']) || $obj['type'] !== 'PipeWire:Interface:Node')
+            continue;
+        $props = isset($obj['info']['props']) ? $obj['info']['props'] : array();
+        $nm = isset($props['node.name']) ? $props['node.name'] : '';
+        $target = isset($props['node.target']) ? $props['node.target'] : '';
+        $targetObj = isset($props['target.object']) ? $props['target.object'] : '';
+
+        $nameMatches = ($nm === $combineNodeName)
+            || strpos($nm, $combineNodeName . '.') === 0
+            || strpos($nm, 'output.' . $combineNodeName . '_') === 0;
+        if (!$nameMatches)
+            continue;
+        if ($target !== $targetNodeName && $targetObj !== $targetNodeName)
+            continue;
+
+        $found[$obj['id']] = pw_node_channel_count($obj);
+    }
+
+    return $found;
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// Helper: how many channels a node's volume array needs.  Taken from the
+// channelVolumes it already reports so the replacement is the same length;
+// stereo is the fallback for a node that reports nothing.
+function pw_node_channel_count($obj)
+{
+    $params = isset($obj['info']['params']['Props']) ? $obj['info']['params']['Props'] : array();
+    foreach ($params as $entry) {
+        if (isset($entry['channelVolumes']) && is_array($entry['channelVolumes']) && !empty($entry['channelVolumes'])) {
+            return count($entry['channelVolumes']);
+        }
+    }
+    return 2;
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// Helper: set a live node's playback level, as a linear gain (1.0 = unity).
+//
+// channelVolumes, not channelmix.volume: channelmix.volume works as a
+// create-stream property in the generated config, but setting it on a running
+// node through pw-cli is accepted without error and changes nothing --
+// measured on a combine-stream output, where 0.25 left the level where 1.0 put
+// it while channelVolumes 0.25 attenuated it by exactly a quarter.
+// channelVolumes is the same stage pactl drives, so it also reads back.
+//
+// The gain is linear here rather than a pactl percentage because that is what
+// the generated config's channelmix.volume values are: a path re-applied by
+// Apply and one set live this way then land on the same level.
+function pw_set_node_volume_linear($nodeId, $linear, $channels = 2)
+{
+    global $SUDO;
+
+    $linear = max(0.0, min(1.0, floatval($linear)));
+    $channels = max(1, intval($channels));
+    $vals = implode(', ', array_fill(0, $channels, round($linear, 4)));
+
+    $env = "PIPEWIRE_RUNTIME_DIR=/run/pipewire-fpp XDG_RUNTIME_DIR=/run/pipewire-fpp";
+    $cmd = $SUDO . " " . $env . " pw-cli set-param " . intval($nodeId)
+        . " Props '{ channelVolumes: [ $vals ] }' 2>&1";
+    $output = shell_exec($cmd);
+
+    return (strpos((string) $output, 'Error') === false);
+}
+
+/////////////////////////////////////////////////////////////////////////////
 // Helper: Stop fppd playback with a timeout to prevent deadlocks.
 // Returns array('wasPlaying' => bool, 'playlist' => string, 'repeat' => bool)
 // Uses stream context timeout so PHP doesn't hang if fppd's HTTP handler
@@ -1451,30 +1549,93 @@ function GetUsbAudioBandwidthCheck()
 
 /////////////////////////////////////////////////////////////////////////////
 // POST /api/pipewire/audio/group/volume
-// Set volume for a specific group or member sink
-function SetPipeWireGroupVolume()
+// Set volume (and optionally mute) for a specific group or member sink.
+// Body: { "sink": "<nodeName>", "volume": 0-150 } or
+//       { "sink": "<nodeName>", "volume": 0-150, "mute": true|false }
+// Also persists the change into pipewire-audio-groups.json (matching the
+// group/member whose node name resolves to "sink") so it survives an fppd
+// restart or reboot via RestorePipeWireGroupVolumes() / restorePipeWireVolumes()
+// -- mirrors the persistence SetInputGroupMemberVolume() already does.
+function SetPipeWireGroupVolume($body = null)
 {
-    global $SUDO;
+    global $SUDO, $settings;
 
-    $data = json_decode(file_get_contents('php://input'), true);
+    $data = pw_volume_body($body);
     if (!isset($data['sink']) || !isset($data['volume'])) {
         http_response_code(400);
         return json(array("status" => "ERROR", "message" => "Missing sink or volume"));
     }
 
-    $sink = escapeshellarg($data['sink']);
+    $sinkName = $data['sink'];
+    $sink = escapeshellarg($sinkName);
     $volume = intval($data['volume']);
     if ($volume < 0)
         $volume = 0;
     if ($volume > 150)
         $volume = 150;
+    $isMuteToggle = isset($data['mute']);
+    $mute = $isMuteToggle ? (bool) $data['mute'] : false;
 
     $env = "PIPEWIRE_RUNTIME_DIR=/run/pipewire-fpp XDG_RUNTIME_DIR=/run/pipewire-fpp PULSE_RUNTIME_PATH=/run/pipewire-fpp/pulse";
 
-    exec($SUDO . " " . $env . " pactl set-sink-volume $sink {$volume}% 2>&1", $output, $return_val);
+    if ($isMuteToggle) {
+        exec($SUDO . " " . $env . " pactl set-sink-mute $sink " . ($mute ? "1" : "0") . " 2>&1", $output, $return_val);
+    } else {
+        exec($SUDO . " " . $env . " pactl set-sink-volume $sink {$volume}% 2>&1", $output, $return_val);
+    }
 
     if ($return_val) {
         return json(array("status" => "ERROR", "message" => "Failed to set volume", "output" => implode("\n", $output)));
+    }
+
+    // Persist into the saved config, resolving the sink node name back to the
+    // group or member it belongs to using the same naming scheme applied
+    // everywhere else in this file (fpp_group_<slug(name)> for a group,
+    // fpp_fx_g<id>_<slug(cardId)> for a member's filter-chain, or the raw
+    // WirePlumber node a member targets directly).
+    $configFile = $settings['mediaDirectory'] . "/config/pipewire-audio-groups.json";
+    if (file_exists($configFile)) {
+        $groupsData = json_decode(file_get_contents($configFile), true);
+        if (is_array($groupsData) && isset($groupsData['groups'])) {
+            $dirty = false;
+            foreach ($groupsData['groups'] as &$group) {
+                $groupName = isset($group['name']) ? $group['name'] : 'Group';
+                $groupNodeName = 'fpp_group_' . preg_replace('/[^a-zA-Z0-9_]/', '_', strtolower($groupName));
+                if ($groupNodeName === $sinkName) {
+                    if ($isMuteToggle) {
+                        $group['mute'] = $mute;
+                    } else {
+                        $group['volume'] = $volume;
+                        $group['mute'] = false;
+                    }
+                    $dirty = true;
+                    break;
+                }
+                if (!isset($group['members']))
+                    continue;
+                $groupId = isset($group['id']) ? intval($group['id']) : 0;
+                foreach ($group['members'] as &$member) {
+                    $cardId = isset($member['cardId']) ? $member['cardId'] : '';
+                    $fxNodeName = 'fpp_fx_g' . $groupId . '_' . preg_replace('/[^a-zA-Z0-9_]/', '_', strtolower($cardId));
+                    $nodeTarget = isset($member['nodeTarget']) ? $member['nodeTarget'] : '';
+                    if ($fxNodeName === $sinkName || ($nodeTarget !== '' && $nodeTarget === $sinkName)) {
+                        if ($isMuteToggle) {
+                            $member['mute'] = $mute;
+                        } else {
+                            $member['volume'] = $volume;
+                            $member['mute'] = false;
+                        }
+                        $dirty = true;
+                        break 2;
+                    }
+                }
+                unset($member);
+            }
+            unset($group);
+            if ($dirty) {
+                file_put_contents($configFile, json_encode($groupsData, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+            }
+        }
     }
 
     return json(array("status" => "OK"));
@@ -2078,6 +2239,10 @@ function ApplyPipeWireInputGroups($skipRestart = false)
         RestartPipeWireStack();
     }
 
+    // The rebuilt combine-stream sinks come up at full volume, so put the saved
+    // bus levels back before anything starts playing through them.
+    RestorePipeWireInputGroupVolumes();
+
     // Set PipeWire default sink and push setting to fppd (best-effort)
     if (!empty($fppdTarget)) {
         $env = "PIPEWIRE_RUNTIME_DIR=/run/pipewire-fpp XDG_RUNTIME_DIR=/run/pipewire-fpp PULSE_RUNTIME_PATH=/run/pipewire-fpp/pulse";
@@ -2112,15 +2277,158 @@ function ApplyPipeWireInputGroups($skipRestart = false)
 }
 
 /////////////////////////////////////////////////////////////////////////////
-// POST /api/pipewire/audio/input-groups/volume
-// Real-time volume control for input group loopback nodes
-// Body: { "groupId": 1, "memberIndex": 0, "volume": 75 }
-// Sets channelmix.volume on the running PipeWire loopback node without restart
-function SetInputGroupMemberVolume()
+// The mix bus's own sink node, from the group's name.  Shared by every caller
+// that has to address the bus rather than something feeding it.
+// KEEP IN SYNC with the node.name GeneratePipeWireInputGroupsConfig() emits.
+function InputGroupNodeName($groupName)
+{
+    return "fpp_input_" . preg_replace('/[^a-zA-Z0-9_]/', '_', strtolower($groupName));
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// POST /api/pipewire/audio/input-group/volume
+// Set a mix bus's own output level (and optionally mute it).
+// Body: { "groupId": 1, "volume": 0-100 } or { ..., "mute": true|false }
+//
+// This is the bus's fader, not a source's: the combine-stream sink every
+// member mixes into, downstream of what feeds it and upstream of the routing
+// paths that leave it.  The saved inputGroups[].volume had no control and
+// nothing applying it, so a mix bus had no output level of its own at all --
+// the only reachable levels were its sources' and its routes'.
+//
+// pactl, matching the output-group and master faders, so a percentage means
+// the same thing on every fader the UI shows.
+function SetInputGroupVolume($bodyOverride = null)
 {
     global $SUDO, $settings;
 
-    $body = json_decode(file_get_contents('php://input'), true);
+    $body = pw_volume_body($bodyOverride);
+    if (!$body || !isset($body['groupId']) || !isset($body['volume'])) {
+        return json(array("status" => "error", "message" => "Missing groupId or volume"));
+    }
+
+    $groupId = intval($body['groupId']);
+    $volumePct = max(0, min(100, intval($body['volume'])));
+    $isMuteToggle = isset($body['mute']);
+    $muted = $isMuteToggle ? (bool) $body['mute'] : false;
+
+    $configFile = $settings['mediaDirectory'] . "/config/pipewire-input-groups.json";
+    if (!file_exists($configFile)) {
+        return json(array("status" => "error", "message" => "No input groups configured"));
+    }
+    $data = json_decode(file_get_contents($configFile), true);
+    if (!is_array($data) || !isset($data['inputGroups'])) {
+        return json(array("status" => "error", "message" => "Invalid input groups config"));
+    }
+
+    $nodeName = '';
+    foreach ($data['inputGroups'] as $ig) {
+        if (isset($ig['id']) && intval($ig['id']) === $groupId) {
+            $nodeName = InputGroupNodeName(isset($ig['name']) ? $ig['name'] : 'Input Group');
+            break;
+        }
+    }
+    if ($nodeName === '') {
+        return json(array("status" => "error", "message" => "Input group $groupId not found"));
+    }
+
+    $env = "PIPEWIRE_RUNTIME_DIR=/run/pipewire-fpp XDG_RUNTIME_DIR=/run/pipewire-fpp PULSE_RUNTIME_PATH=/run/pipewire-fpp/pulse";
+    if ($isMuteToggle) {
+        exec($SUDO . " " . $env . " pactl set-sink-mute " . escapeshellarg($nodeName) . " " . ($muted ? "1" : "0") . " 2>&1", $out, $rv);
+    } else {
+        exec($SUDO . " " . $env . " pactl set-sink-volume " . escapeshellarg($nodeName) . " {$volumePct}% 2>&1", $out, $rv);
+    }
+    $success = ($rv === 0);
+
+    foreach ($data['inputGroups'] as &$ig) {
+        if (isset($ig['id']) && intval($ig['id']) === $groupId) {
+            if ($isMuteToggle) {
+                $ig['mute'] = $muted;
+            } else {
+                $ig['volume'] = $volumePct;
+                $ig['mute'] = false;
+            }
+            break;
+        }
+    }
+    unset($ig);
+    file_put_contents($configFile, json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+
+    $what = $isMuteToggle
+        ? ($muted ? "Muted $nodeName" : "Unmuted $nodeName")
+        : "Bus volume set to {$volumePct}% on $nodeName";
+
+    return json(array(
+        "status" => $success ? "OK" : "error",
+        "message" => $success ? $what : "Failed to set volume on $nodeName",
+        "nodeName" => $nodeName,
+        "volume" => $volumePct
+    ));
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// Reapply the saved mix bus levels.  The combine-stream sinks are rebuilt at
+// full volume every time the PipeWire stack starts, so without this a bus
+// fader lasts only until the next apply or reboot.
+// KEEP IN SYNC with restorePipeWireVolumes() in FPPINIT_Audio.cpp.
+function RestorePipeWireInputGroupVolumes($inputGroups = null)
+{
+    global $SUDO, $settings;
+
+    if ($inputGroups === null) {
+        $configFile = $settings['mediaDirectory'] . "/config/pipewire-input-groups.json";
+        if (!file_exists($configFile))
+            return;
+        $data = json_decode(file_get_contents($configFile), true);
+        if (!is_array($data) || !isset($data['inputGroups']))
+            return;
+        $inputGroups = $data['inputGroups'];
+    }
+
+    $env = "PIPEWIRE_RUNTIME_DIR=/run/pipewire-fpp XDG_RUNTIME_DIR=/run/pipewire-fpp PULSE_RUNTIME_PATH=/run/pipewire-fpp/pulse";
+
+    foreach ($inputGroups as $ig) {
+        if (!isset($ig['enabled']) || !$ig['enabled'])
+            continue;
+        $nodeName = escapeshellarg(InputGroupNodeName(isset($ig['name']) ? $ig['name'] : 'Input Group'));
+        $vol = isset($ig['volume']) ? intval($ig['volume']) : 100;
+        exec($SUDO . " " . $env . " pactl set-sink-volume $nodeName {$vol}% 2>/dev/null");
+        exec($SUDO . " " . $env . " pactl set-sink-mute $nodeName " . (!empty($ig['mute']) ? "1" : "0") . " 2>/dev/null");
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// Helper: persist an input-group member's level so it survives a restart and
+// so the next GET reports what the fader was just moved to.  A mute keeps the
+// saved percentage -- that is what unmuting restores it to.
+function PersistInputGroupMemberVolume($configFile, $data, $groupId, $memberIndex, $volumePct, $isMuteToggle, $muted)
+{
+    foreach ($data['inputGroups'] as &$ig) {
+        if (isset($ig['id']) && intval($ig['id']) === $groupId) {
+            if ($isMuteToggle) {
+                $ig['members'][$memberIndex]['mute'] = $muted;
+            } else {
+                $ig['members'][$memberIndex]['volume'] = $volumePct;
+                $ig['members'][$memberIndex]['mute'] = false;
+            }
+            break;
+        }
+    }
+    unset($ig);
+    file_put_contents($configFile, json_encode($data, JSON_PRETTY_PRINT));
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// POST /api/pipewire/audio/input-groups/volume
+// Real-time volume control for an input group member.
+// Body: { "groupId": 1, "memberIndex": 0, "volume": 75 }
+// Moves the running loopback node's level without a restart -- or, for a
+// stream that feeds only this bus and so has no loopback, fppd's own stage.
+function SetInputGroupMemberVolume($bodyOverride = null)
+{
+    global $SUDO, $settings;
+
+    $body = pw_volume_body($bodyOverride);
     if (!$body || !isset($body['groupId']) || !isset($body['memberIndex']) || !isset($body['volume'])) {
         return json(array("status" => "error", "message" => "Missing groupId, memberIndex, or volume"));
     }
@@ -2128,7 +2436,12 @@ function SetInputGroupMemberVolume()
     $groupId = intval($body['groupId']);
     $memberIndex = intval($body['memberIndex']);
     $volumePct = max(0, min(100, intval($body['volume'])));
-    $volumeLinear = round($volumePct / 100.0, 3);
+    // A mute is a zero on the same level, with the saved percentage left alone
+    // so unmuting restores it.  This used to apply $volumePct either way, so
+    // muting a member persisted the flag and changed nothing anyone could hear.
+    $isMuteToggle = isset($body['mute']);
+    $muted = $isMuteToggle ? (bool) $body['mute'] : false;
+    $volumeLinear = round(($muted ? 0 : $volumePct) / 100.0, 3);
 
     // Load input groups config to resolve the node name
     $configFile = $settings['mediaDirectory'] . "/config/pipewire-input-groups.json";
@@ -2187,64 +2500,77 @@ function SetInputGroupMemberVolume()
         return json(array("status" => "error", "message" => "Invalid PipeWire dump"));
     }
 
-    // Find all nodes that belong to this loopback (capture + playback sides)
-    // PipeWire loopback modules create sub-nodes named input.NAME and output.NAME
-    // (there is no bare parent node), so we match both patterns.
+    // Find the node that carries this loopback's level.  PipeWire loopback
+    // modules create sub-nodes named input.NAME and output.NAME (there is no
+    // bare parent node); the level belongs on the playback side alone -- set
+    // on both, one member's trim would be applied twice.
     $nodeIds = array();
+    $fallbackIds = array();
     foreach ($objects as $obj) {
         $type = isset($obj['type']) ? $obj['type'] : '';
         if ($type !== 'PipeWire:Interface:Node')
             continue;
         $props = isset($obj['info']['props']) ? $obj['info']['props'] : array();
         $nm = isset($props['node.name']) ? $props['node.name'] : '';
-        if (
-            $nm === $loopbackNodeName ||
-            $nm === 'input.' . $loopbackNodeName ||
-            $nm === 'output.' . $loopbackNodeName
-        ) {
-            $nodeIds[] = $obj['id'];
+        if ($nm === 'output.' . $loopbackNodeName) {
+            $nodeIds[$obj['id']] = pw_node_channel_count($obj);
+        } elseif ($nm === $loopbackNodeName || $nm === 'input.' . $loopbackNodeName) {
+            $fallbackIds[$obj['id']] = pw_node_channel_count($obj);
         }
+    }
+    if (empty($nodeIds)) {
+        $nodeIds = $fallbackIds;
+    }
+
+    if (empty($nodeIds) && $mbrType === 'fppd_stream') {
+        // No loopback, because this stream feeds only this one bus:
+        // GeneratePipeWireInputGroupsConfig() lets fppd's sink connect straight
+        // to the combine-stream and only builds a tee and per-group loopbacks
+        // once a stream fans out to two or more groups.  There is therefore no
+        // send stage between this source and this bus to move.
+        //
+        // The one level that does exist is fppd's own, inside the stream -- but
+        // that is the source's level, the media stream slot fader, and driving
+        // it from here would make a per-bus send silently turn the source down
+        // for every bus it feeds.  A source, its send into a bus and the bus's
+        // own output are three separate stages; say what is missing instead of
+        // borrowing one of the others.
+        $slot = 1;
+        if (preg_match('/fppd_stream_(\d+)/', $sourceId, $slotMatch)) {
+            $slot = intval($slotMatch[1]);
+        }
+        return json(array(
+            "status" => "error",
+            "message" => "$sourceId feeds this bus directly, so it has no send level of its own."
+                . " Set the source on media stream slot $slot, or the bus output on this group.",
+            "nodeName" => $sourceId,
+            "slot" => $slot,
+            "directToBus" => true
+        ));
     }
 
     if (empty($nodeIds)) {
-        if ($mbrType === 'fppd_stream') {
-            // Primary group — no loopback exists; volume controlled via fppd
-            return json(array("status" => "error", "message" => "This stream's primary group volume is controlled via fppd, not PipeWire loopback"));
-        }
         return json(array("status" => "error", "message" => "Loopback node '$loopbackNodeName' not found in PipeWire (is it muted or not applied?)"));
     }
 
-    // Set volume on the playback side using pw-cli set-param
-    // The channelmix.volume prop is on the node's Props param
+    // Move the playback side's level.  channelVolumes rather than
+    // channelmix.volume -- see pw_set_node_volume_linear().
     $success = false;
-    foreach ($nodeIds as $nid) {
-        $cmd = $SUDO . " " . $env . " pw-cli set-param $nid Props '{ channelmix.volume: $volumeLinear }' 2>&1";
-        $output = shell_exec($cmd);
-        if (strpos($output, 'Error') === false) {
+    foreach ($nodeIds as $nid => $channels) {
+        if (pw_set_node_volume_linear($nid, $volumeLinear, $channels)) {
             $success = true;
         }
     }
 
-    // Also update the saved config for persistence
-    // If this is a mute toggle, persist the mute flag but don't overwrite the saved volume
-    $isMuteToggle = isset($body['mute']);
-    foreach ($data['inputGroups'] as &$ig) {
-        if (isset($ig['id']) && intval($ig['id']) === $groupId) {
-            if ($isMuteToggle) {
-                $ig['members'][$memberIndex]['mute'] = (bool) $body['mute'];
-            } else {
-                $ig['members'][$memberIndex]['volume'] = $volumePct;
-                $ig['members'][$memberIndex]['mute'] = false;
-            }
-            break;
-        }
-    }
-    unset($ig);
-    file_put_contents($configFile, json_encode($data, JSON_PRETTY_PRINT));
+    PersistInputGroupMemberVolume($configFile, $data, $groupId, $memberIndex, $volumePct, $isMuteToggle, $muted);
+
+    $what = $isMuteToggle
+        ? ($muted ? "Muted $loopbackNodeName" : "Unmuted $loopbackNodeName at {$volumePct}%")
+        : "Volume set to {$volumePct}% on $loopbackNodeName";
 
     return json(array(
         "status" => $success ? "OK" : "error",
-        "message" => $success ? "Volume set to {$volumePct}% on $loopbackNodeName" : "Failed to set volume on PipeWire node",
+        "message" => $success ? $what : "Failed to set volume on PipeWire node",
         "nodeName" => $loopbackNodeName,
         "volume" => $volumePct,
         "volumeLinear" => $volumeLinear
@@ -2252,13 +2578,55 @@ function SetInputGroupMemberVolume()
 }
 
 /////////////////////////////////////////////////////////////////////////////
+// Persist a stream slot volume so it survives an fppd restart / reboot.
+// All five slots are stored: a slot's fader is its own stage, independent of
+// the master (which is applied downstream on the output sinks).
+// KEEP IN SYNC with savedStreamSlotVolume() in StreamSlotManager.cpp.
+function SaveStreamSlotVolume($slot, $volume)
+{
+    global $settings;
+
+    if ($slot < 1 || $slot > 5)
+        return;
+
+    $configFile = $settings['mediaDirectory'] . "/config/pipewire-stream-slots.json";
+    $data = array("slots" => array());
+    if (file_exists($configFile)) {
+        $existing = json_decode(file_get_contents($configFile), true);
+        if (is_array($existing) && isset($existing['slots']) && is_array($existing['slots'])) {
+            $data = $existing;
+        }
+    }
+    $data['slots'][strval($slot)] = intval($volume);
+    file_put_contents($configFile, json_encode($data, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// GET /api/pipewire/audio/stream/volumes
+// Returns the persisted per-slot volumes, e.g. { "slots": { "2": 80 } }.
+// Slots with no saved value are simply absent; callers default them to 100.
+function GetStreamSlotVolumes()
+{
+    global $settings;
+
+    $configFile = $settings['mediaDirectory'] . "/config/pipewire-stream-slots.json";
+    if (file_exists($configFile)) {
+        $data = json_decode(file_get_contents($configFile), true);
+        if (is_array($data) && isset($data['slots'])) {
+            return json($data);
+        }
+    }
+    return json(array("slots" => array()));
+}
+
+/////////////////////////////////////////////////////////////////////////////
 // POST /api/pipewire/audio/stream/volume
 // Set volume on a specific fppd stream slot (1-5).
 // Body: { "slot": 1, "volume": 80 }
 // Uses fppd's own volume control via HTTP command API.
-function SetStreamSlotVolume()
+function SetStreamSlotVolume($bodyOverride = null)
 {
-    $body = json_decode(file_get_contents('php://input'), true);
+    $body = pw_volume_body($bodyOverride);
     if (!$body || !isset($body['slot']) || !isset($body['volume'])) {
         return json(array("status" => "error", "message" => "Missing slot or volume"));
     }
@@ -2266,55 +2634,473 @@ function SetStreamSlotVolume()
     $slot = max(1, min(5, intval($body['slot'])));
     $volume = max(0, min(100, intval($body['volume'])));
 
-    // Use fppd's volume command — for slot 1 this maps to the global volume
-    // For other slots, fppd must handle per-slot volume via StreamSlotManager
-    $url = "http://127.0.0.1:32322/api/command";
-    $cmd = array(
-        "command" => "Volume Set",
-        "args" => array(strval($volume))
-    );
+    // Save first: a slot's node only exists while that stream is playing, so a
+    // volume set for an idle slot must still be remembered and applied when it
+    // next starts rather than being reported as a failure.
+    SaveStreamSlotVolume($slot, $volume);
 
-    // For slot > 1, use the stream-slot-specific endpoint
-    if ($slot > 1) {
-        // Direct PipeWire volume control on the stream node
-        $env = "PIPEWIRE_RUNTIME_DIR=/run/pipewire-fpp XDG_RUNTIME_DIR=/run/pipewire-fpp";
-        $nodeName = "fppd_stream_$slot";
+    // Every slot goes through fppd's own Set Slot Volume command, which applies
+    // it to that stream's volume stage.
+    //
+    // Slot 1 used to be special-cased to the global "Volume Set" instead, which
+    // made it a second control for the master rather than a fader of its own --
+    // moving slot 1 moved the master with it. It is an ordinary slot now; the
+    // master is applied downstream on the output sinks and multiplies with it.
+    //
+    // This is also the same stage StreamSlotManager restores from the saved
+    // value when a stream starts, so a live change and a restored one cannot
+    // stack on top of each other the way a separate pw-cli node property would.
+    $cmd = array("command" => "Set Slot Volume", "args" => array(strval($slot), strval($volume)));
 
-        // Find node ID for this stream
-        global $SUDO;
-        $raw = shell_exec($SUDO . " " . $env . " pw-dump 2>/dev/null");
-        if (!empty($raw)) {
-            $objects = json_decode($raw, true);
-            if (is_array($objects)) {
-                $volumeLinear = round($volume / 100.0, 3);
-                foreach ($objects as $obj) {
-                    $type = isset($obj['type']) ? $obj['type'] : '';
-                    if ($type !== 'PipeWire:Interface:Node')
-                        continue;
-                    $props = isset($obj['info']['props']) ? $obj['info']['props'] : array();
-                    $nm = isset($props['node.name']) ? $props['node.name'] : '';
-                    if ($nm === $nodeName) {
-                        $cmd2 = $SUDO . " " . $env . " pw-cli set-param " . $obj['id'] . " Props '{ channelmix.volume: $volumeLinear }' 2>&1";
-                        shell_exec($cmd2);
-                        return json(array("status" => "OK", "slot" => $slot, "volume" => $volume));
-                    }
-                }
-            }
-        }
-        return json(array("status" => "error", "message" => "Stream node $nodeName not found in PipeWire"));
-    }
-
-    // Slot 1: use fppd's built-in volume command
-    $ch = curl_init($url);
+    $ch = curl_init("http://127.0.0.1:32322/command");
     curl_setopt($ch, CURLOPT_POST, 1);
     curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($cmd));
     curl_setopt($ch, CURLOPT_HTTPHEADER, array('Content-Type: application/json'));
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
     curl_setopt($ch, CURLOPT_TIMEOUT, 3);
     $result = curl_exec($ch);
+    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
     curl_close($ch);
 
+    if ($result === false || $code !== 200) {
+        return json(array("status" => "error", "slot" => $slot,
+            "message" => "fppd did not accept the slot volume command (HTTP $code)"));
+    }
+
+    // An idle slot has no stream to apply to; the value is saved either way and
+    // takes effect when it next plays.
     return json(array("status" => "OK", "slot" => $slot, "volume" => $volume));
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// GET /api/pipewire/audio/node-states
+// Returns { "<nodeName>": "running"|"idle"|"suspended"|"error", ... } for every
+// node currently in the PipeWire graph.  Drives the mixer's per-channel
+// activity LEDs: a node only reaches "running" while PipeWire is actually
+// processing audio through it.  Coarse (presence, not level) but free -- it is
+// one more consumer of the same pw-dump the volume setters already shell.
+function GetPipeWireNodeStates()
+{
+    global $SUDO;
+
+    $env = "PIPEWIRE_RUNTIME_DIR=/run/pipewire-fpp XDG_RUNTIME_DIR=/run/pipewire-fpp";
+    $raw = shell_exec($SUDO . " " . $env . " pw-dump 2>/dev/null");
+    if (empty($raw)) {
+        return json(array("status" => "error", "message" => "Cannot connect to PipeWire", "nodes" => array()));
+    }
+
+    $objects = json_decode($raw, true);
+    if (!is_array($objects)) {
+        return json(array("status" => "error", "message" => "Invalid PipeWire dump", "nodes" => array()));
+    }
+
+    $nodes = array();
+    $targets = array();
+    foreach ($objects as $obj) {
+        if (!isset($obj['type']) || $obj['type'] !== 'PipeWire:Interface:Node')
+            continue;
+        $props = isset($obj['info']['props']) ? $obj['info']['props'] : array();
+        $nm = isset($props['node.name']) ? $props['node.name'] : '';
+        if ($nm === '')
+            continue;
+        $nodes[$nm] = isset($obj['info']['state']) ? $obj['info']['state'] : 'unknown';
+        if (isset($props['node.target'])) {
+            $targets[$nm] = $props['node.target'];
+        }
+    }
+
+    return json(array(
+        "status" => "OK",
+        "nodes" => $nodes,
+        "entities" => PipeWireEntityStates($nodes, $targets)
+    ));
+}
+
+// Map each addressable mixer control to the state of the node that actually
+// carries its audio, keyed the same way as GET /api/pipewire/audio/targets.
+//
+// Resolved here rather than in the browser because the node-naming rules
+// (loopbacks, effect chains, combine-stream outputs) already live in this file
+// and are not guessable from the group config alone -- an input group's bus is
+// fpp_input_<slug> or fpp_route_ig_<id> depending on whether it has effects,
+// and a routing path is an internal combine-stream output identified by its
+// node.target rather than by name.
+function PipeWireEntityStates($nodes, $targets)
+{
+    global $settings;
+
+    $entities = array();
+
+    for ($slot = 1; $slot <= 5; $slot++) {
+        $nm = "fppd_stream_$slot";
+        $entities["slot:$slot"] = isset($nodes[$nm]) ? $nodes[$nm] : 'unknown';
+    }
+
+    $groupsFile = $settings['mediaDirectory'] . "/config/pipewire-audio-groups.json";
+    $ogNodeById = array();
+    if (file_exists($groupsFile)) {
+        $data = json_decode(file_get_contents($groupsFile), true);
+        if (is_array($data) && isset($data['groups'])) {
+            foreach ($data['groups'] as $group) {
+                $groupId = isset($group['id']) ? intval($group['id']) : 0;
+                $groupNode = 'fpp_group_' . preg_replace('/[^a-zA-Z0-9_]/', '_', strtolower(isset($group['name']) ? $group['name'] : 'Group'));
+                $ogNodeById[$groupId] = $groupNode;
+                $entities["sink:$groupNode"] = isset($nodes[$groupNode]) ? $nodes[$groupNode] : 'unknown';
+                if (!isset($group['members']))
+                    continue;
+                foreach ($group['members'] as $member) {
+                    $cardId = isset($member['cardId']) ? $member['cardId'] : '';
+                    if ($cardId === '')
+                        continue;
+                    $fxNode = 'fpp_fx_g' . $groupId . '_' . preg_replace('/[^a-zA-Z0-9_]/', '_', strtolower($cardId));
+                    $entities["sink:$fxNode"] = isset($nodes[$fxNode]) ? $nodes[$fxNode] : 'unknown';
+                }
+            }
+        }
+    }
+
+    $inputFile = $settings['mediaDirectory'] . "/config/pipewire-input-groups.json";
+    if (!file_exists($inputFile)) {
+        return $entities;
+    }
+    $igData = json_decode(file_get_contents($inputFile), true);
+    if (!is_array($igData) || !isset($igData['inputGroups'])) {
+        return $entities;
+    }
+
+    foreach ($igData['inputGroups'] as $ig) {
+        $igId = isset($ig['id']) ? intval($ig['id']) : 0;
+        $igName = isset($ig['name']) ? $ig['name'] : '';
+        $hasEffects = isset($ig['effects']['eq']['enabled']) && $ig['effects']['eq']['enabled']
+            && isset($ig['effects']['eq']['bands']) && !empty($ig['effects']['eq']['bands']);
+        $busNode = $hasEffects ? "fpp_route_ig_$igId"
+            : "fpp_input_" . preg_replace('/[^a-zA-Z0-9_]/', '_', strtolower($igName));
+        $busState = isset($nodes[$busNode]) ? $nodes[$busNode] : 'unknown';
+
+        // Members: a member gets its own loopback only when it is not the
+        // primary fppd stream (that one feeds the bus directly, with no node of
+        // its own), so fall back to the bus it feeds rather than showing a
+        // control that can never light up.
+        if (isset($ig['members'])) {
+            foreach ($ig['members'] as $idx => $mbr) {
+                $mbrType = isset($mbr['type']) ? $mbr['type'] : '';
+                if ($mbrType === 'fppd_stream') {
+                    $sourceId = isset($mbr['sourceId']) ? $mbr['sourceId'] : 'fppd_stream_1';
+                    $slug = preg_replace('/[^a-zA-Z0-9_]/', '_', strtolower($sourceId));
+                } else {
+                    $slug = preg_replace('/[^a-zA-Z0-9_]/', '_', strtolower(isset($mbr['name']) ? $mbr['name'] : "Member $idx"));
+                }
+                $loopback = "fpp_loopback_ig{$igId}_{$slug}";
+                $state = null;
+                foreach (array($loopback, "output.$loopback", "input.$loopback") as $cand) {
+                    if (isset($nodes[$cand])) {
+                        $state = $nodes[$cand];
+                        break;
+                    }
+                }
+                if ($state === null && $mbrType === 'fppd_stream') {
+                    // No loopback of its own -- report the source stream itself,
+                    // which is exactly what this control is riding on.
+                    $srcNode = isset($mbr['sourceId']) ? $mbr['sourceId'] : 'fppd_stream_1';
+                    $state = isset($nodes[$srcNode]) ? $nodes[$srcNode] : $busState;
+                }
+                $entities["input:$igId:$idx"] = $state === null ? $busState : $state;
+            }
+        }
+
+        // Routing paths: the combine-stream's internal output for a given
+        // destination is identified by node.target, the same test
+        // SetRoutingPathVolume() uses to find the node it writes.
+        foreach ($ogNodeById as $ogId => $ogNode) {
+            $state = 'unknown';
+            foreach ($nodes as $nm => $st) {
+                if (!isset($targets[$nm]) || $targets[$nm] !== $ogNode)
+                    continue;
+                if (strpos($nm, $busNode) === false)
+                    continue;
+                $state = $st;
+                break;
+            }
+            $entities["route:$igId:$ogId"] = $state;
+        }
+    }
+
+    return $entities;
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// POST /api/pipewire/audio/meters
+// Body: { "nodes": ["fpp_group_x", ...], "ttl": 6000 }
+//
+// Passthrough to fppd, which owns the metering pipelines. The levels come back
+// to the browser over the /fppdws WebSocket, not through here -- this only says
+// which nodes to meter, and has to be re-posted to keep them alive so metering
+// stops on its own when a page goes away.
+function SetPipeWireAudioMeters()
+{
+    $body = file_get_contents('php://input');
+
+    $ch = curl_init("http://127.0.0.1:32322/fppd/meters");
+    curl_setopt($ch, CURLOPT_POST, 1);
+    curl_setopt($ch, CURLOPT_POSTFIELDS, $body);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, array('Content-Type: application/json'));
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 3);
+    $result = curl_exec($ch);
+    $code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    if ($result === false || $code !== 200) {
+        return json(array("status" => "ERROR", "message" => "fppd did not accept the meter subscription"));
+    }
+    return json(array("status" => "OK"));
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// GET /api/pipewire/audio/preview?node=<nodeName>
+// Streams a node's monitor source back to the browser as MP3 so the user can
+// audition one output without leaving the page.
+//
+// parec reads the sink's .monitor source; ffmpeg transcodes the raw PCM to MP3
+// (both are already FPP dependencies).  Only one preview may run at a time and
+// it is capped at PREVIEW_MAX_SECONDS -- these are real transcoding processes
+// on what is often a Pi, so they must not be able to accumulate.
+function GetPipeWireAudioPreview()
+{
+    global $SUDO, $settings;
+
+    define('PREVIEW_MAX_SECONDS', 120);
+
+    $node = isset($_GET['node']) ? $_GET['node'] : '';
+    // Interpolated into a shell command; PipeWire node names are plain
+    // identifiers, so anything else is a reason to refuse rather than to quote
+    // harder.
+    if ($node === '' || preg_match('/[^a-zA-Z0-9_.\-]/', $node)) {
+        http_response_code(400);
+        return json(array("status" => "ERROR", "message" => "Invalid or missing node name"));
+    }
+
+    // Only one preview at a time, but keyed on the node: a browser routinely
+    // opens more than one request for a single media element (an initial fetch
+    // then a ranged or retried one), and killing the previous stream on every
+    // request tore down the very stream that element was playing. Switching to
+    // a different output still stops the old one, which is the behaviour that
+    // actually matters; a duplicate for the same node is transient -- the
+    // abandoned one dies when its client goes away, and the runtime cap bounds
+    // it regardless.
+    //
+    // Under the media dir, not /run: the pid is written by the sudo'd shell
+    // (root) but has to be removed by this script running as the web user, and
+    // unlinking needs write permission on the containing directory.
+    $lockFile = $settings['mediaDirectory'] . '/tmp/pipewire-preview.pid';
+    $prev = trim(strval(@file_get_contents($lockFile)));
+    if ($prev !== '') {
+        $parts = explode(' ', $prev, 2);
+        $prevNode = isset($parts[1]) ? trim($parts[1]) : '';
+        if ($prevNode !== $node) {
+            PipeWirePreviewKill($parts[0]);
+            @unlink($lockFile);
+        }
+    }
+
+    $env = "PIPEWIRE_RUNTIME_DIR=/run/pipewire-fpp XDG_RUNTIME_DIR=/run/pipewire-fpp PULSE_RUNTIME_PATH=/run/pipewire-fpp/pulse";
+    $monitor = escapeshellarg($node . '.monitor');
+
+    // setsid gives the pipeline its own process group so one signal takes down
+    // both halves; timeout is the backstop if the client never disconnects.
+    //
+    // The group id is recorded by the spawned shell itself ($$ under setsid is
+    // the new group leader).  proc_get_status() cannot be used for this: it
+    // reports the setsid wrapper, whose group is still the web server's -- so
+    // signalling it killed the wrong group (in testing, the request doing the
+    // killing rather than the stream being replaced).
+    // The flags all exist to get audio moving promptly; without them a live
+    // audition sat silent for ~5s and then burst.  The big one is
+    // -analyzeduration/-probesize: ffmpeg's default is to probe 5 seconds of
+    // input before producing anything, which is pure latency on a raw stream
+    // whose format is already fully specified on the command line.
+    // -flush_packets/-nobuffer stop the muxer hoarding frames, and parec's
+    // short latency keeps the capture side from adding its own delay.
+    $pipeline = "parec --latency-msec=100 -d $monitor --format=s16le --rate=48000 --channels=2 --raw | " .
+        "ffmpeg -loglevel quiet -analyzeduration 0 -probesize 32 -fflags +nobuffer -flush_packets 1 " .
+        "-f s16le -ar 48000 -ac 2 -i pipe:0 -f mp3 -b:a 128k pipe:1";
+    // The shell records its own group id, then removes the pid file on the way
+    // out -- whether it finishes, hits the timeout, or is signalled when a new
+    // preview replaces it.  Cleanup belongs here rather than only in PHP: the
+    // file is root-owned, and an aborted request cannot be relied on to run its
+    // own teardown.  No exec, so the trap survives to fire.
+    // Record the process GROUP id, not $$. setsid forks when its caller is
+    // already a group leader (which the shell proc_open spawns is), so $$ is a
+    // member of the new group rather than its leader -- and "kill -- -$$" then
+    // names a group that does not exist and silently signals nothing, which is
+    // why switching preview never actually stopped the previous stream.
+    // --foreground matters: GNU timeout otherwise runs the pipeline in a process
+    // group of its own, so the group recorded here would not contain parec or
+    // ffmpeg and signalling it did nothing at all.
+    //
+    // "kill -TERM 0" signals this shell's whole group, which is what actually
+    // tears the pipeline down -- on the way out normally, and from the trap
+    // when a different preview replaces this one.
+    $inner = "echo \"\$(ps -o pgid= -p \$\$ | tr -d ' ') " . $node . "\" > " . $lockFile . "; " .
+        "trap 'rm -f " . $lockFile . "; trap - TERM; kill -TERM 0' TERM INT HUP; " .
+        "timeout --foreground " . PREVIEW_MAX_SECONDS . " sh -c " . escapeshellarg($pipeline) . "; " .
+        "rm -f " . $lockFile . "; trap - TERM; kill -TERM 0";
+    $cmd = "setsid " . $SUDO . " " . $env . " sh -c " . escapeshellarg($inner);
+
+    $descriptors = array(1 => array('pipe', 'w'), 2 => array('file', '/dev/null', 'w'));
+    $proc = proc_open($cmd, $descriptors, $pipes);
+    if (!is_resource($proc)) {
+        http_response_code(500);
+        return json(array("status" => "ERROR", "message" => "Could not start preview"));
+    }
+
+    // Learn our own group id once the shell has written it, so cleanup below
+    // signals this stream and not whichever one replaced it.
+    $myPid = 0;
+    for ($i = 0; $i < 20 && $myPid <= 0; $i++) {
+        usleep(50000);
+        $myPid = intval(strtok(trim(strval(@file_get_contents($lockFile))), ' '));
+    }
+
+    // A disconnecting client aborts the script outright, so the teardown after
+    // the read loop is not guaranteed to run.  Shutdown functions still do.
+    register_shutdown_function(function () use ($myPid, $lockFile) {
+        PipeWirePreviewKill($myPid);
+        if ($myPid > 0 && intval(strtok(trim(strval(@file_get_contents($lockFile))), ' ')) === $myPid) {
+            @unlink($lockFile);
+        }
+    });
+
+    // Unbuffered passthrough: this response never ends on its own, so nothing
+    // downstream may try to accumulate it.
+    while (ob_get_level() > 0) {
+        ob_end_clean();
+    }
+    header('Content-Type: audio/mpeg');
+    header('Cache-Control: no-store');
+    header('X-Accel-Buffering: no');
+    ignore_user_abort(false);
+
+    // Small reads, unbuffered: fread() on a pipe blocks until it can fill the
+    // requested length, so a large buffer here shows up as several seconds of
+    // silence before the browser gets its first frame.
+    stream_set_read_buffer($pipes[1], 0);
+    $start = time();
+    while (!feof($pipes[1])) {
+        $chunk = fread($pipes[1], 1024);
+        if ($chunk === false || $chunk === '') {
+            break;
+        }
+        echo $chunk;
+        flush();
+        // Closing the modal or hitting stop drops the connection; tear the
+        // pipeline down immediately rather than waiting out the timeout.
+        if (connection_aborted() || (time() - $start) > PREVIEW_MAX_SECONDS) {
+            break;
+        }
+    }
+
+    fclose($pipes[1]);
+    proc_close($proc);
+    // Teardown (signalling the group, clearing the lock only if it is still
+    // ours) is handled by the shutdown function registered above, so it also
+    // happens when the client disconnects mid-stream.
+    exit;
+}
+
+// Signal a preview pipeline's whole process group.  Guarded rather than
+// trusting the caller: a bad value here would signal an unrelated group, and
+// pid 0 / negative would signal the web server's own.
+function PipeWirePreviewKill($pid)
+{
+    global $SUDO;
+
+    $pid = intval(trim(strval($pid)));
+    if ($pid <= 1) {
+        return;
+    }
+    // A stale pid file can outlive its process, and pids get recycled -- so
+    // confirm this really is one of our capture pipelines before signalling
+    // its whole process group.
+    $cmdline = @file_get_contents("/proc/$pid/cmdline");
+    if ($cmdline === false || strpos($cmdline, 'parec') === false) {
+        return;
+    }
+    @exec($SUDO . " kill -TERM -" . $pid . " 2>/dev/null");
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// GET /api/pipewire/audio/targets
+// Flat { "<targetKey>": "<label>" } map of everything the volume API can
+// address, for API discoverability and to populate the optional "target"
+// dropdown on the Volume Set / Volume Adjust commands.  The object-map shape is
+// what fpp.js's contentListUrl handling expects (key posted, value displayed).
+function GetPipeWireVolumeTargets()
+{
+    global $settings;
+
+    $targets = array();
+
+    for ($slot = 1; $slot <= 5; $slot++) {
+        $targets["slot:$slot"] = "Media Stream Slot $slot";
+    }
+
+    $groupsFile = $settings['mediaDirectory'] . "/config/pipewire-audio-groups.json";
+    if (file_exists($groupsFile)) {
+        $data = json_decode(file_get_contents($groupsFile), true);
+        if (is_array($data) && isset($data['groups'])) {
+            foreach ($data['groups'] as $group) {
+                $groupName = isset($group['name']) ? $group['name'] : 'Group';
+                $groupId = isset($group['id']) ? intval($group['id']) : 0;
+                $groupNode = 'fpp_group_' . preg_replace('/[^a-zA-Z0-9_]/', '_', strtolower($groupName));
+                $targets["sink:$groupNode"] = "Output Group: $groupName";
+                if (!isset($group['members']))
+                    continue;
+                foreach ($group['members'] as $member) {
+                    $cardId = isset($member['cardId']) ? $member['cardId'] : '';
+                    if ($cardId === '')
+                        continue;
+                    $fxNode = 'fpp_fx_g' . $groupId . '_' . preg_replace('/[^a-zA-Z0-9_]/', '_', strtolower($cardId));
+                    $targets["sink:$fxNode"] = "  $groupName / $cardId";
+                }
+            }
+        }
+    }
+
+    $inputFile = $settings['mediaDirectory'] . "/config/pipewire-input-groups.json";
+    if (file_exists($inputFile)) {
+        $data = json_decode(file_get_contents($inputFile), true);
+        if (is_array($data) && isset($data['inputGroups'])) {
+            $ogNames = array();
+            if (isset($groupsFile) && file_exists($groupsFile)) {
+                $ogData = json_decode(file_get_contents($groupsFile), true);
+                if (is_array($ogData) && isset($ogData['groups'])) {
+                    foreach ($ogData['groups'] as $og) {
+                        $ogNames[intval($og['id'])] = isset($og['name']) ? $og['name'] : 'Group';
+                    }
+                }
+            }
+            foreach ($data['inputGroups'] as $ig) {
+                $igId = isset($ig['id']) ? intval($ig['id']) : 0;
+                $igName = isset($ig['name']) ? $ig['name'] : "Input Group $igId";
+                if (isset($ig['members'])) {
+                    foreach ($ig['members'] as $idx => $mbr) {
+                        $mbrName = isset($mbr['name']) ? $mbr['name'] : "Member $idx";
+                        $targets["input:$igId:$idx"] = "$igName / $mbrName";
+                    }
+                }
+                if (isset($ig['outputs'])) {
+                    foreach ($ig['outputs'] as $ogId) {
+                        $ogId = intval($ogId);
+                        $ogName = isset($ogNames[$ogId]) ? $ogNames[$ogId] : "Group $ogId";
+                        $targets["route:$igId:$ogId"] = "$igName \u{2192} $ogName";
+                    }
+                }
+            }
+        }
+    }
+
+    return json($targets);
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -2324,8 +3110,10 @@ function GetStreamSlotStatus()
 {
     $result = array();
 
-    // Query fppd status
-    $ch = curl_init("http://127.0.0.1:32322/api/fppd/status");
+    // Query fppd status. No /api prefix: that is added by Apache for the PHP
+    // API and is a 404 on fppd's own server, so this fetched nothing and every
+    // slot reported empty media details.
+    $ch = curl_init("http://127.0.0.1:32322/fppd/status");
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
     curl_setopt($ch, CURLOPT_TIMEOUT, 3);
     $raw = curl_exec($ch);
@@ -2365,10 +3153,18 @@ function GetStreamSlotStatus()
             }
         }
 
-        // Slot 1 gets extra info from fppd status
-        if ($slot === 1 && !empty($fppStatus['media_filename'])) {
+        // Slot 1 gets extra info from fppd status. fppd reports the playing
+        // media as current_song; media_filename is not a key it emits, so the
+        // filename was always blank even once the status fetch worked.
+        $nowPlaying = '';
+        if (!empty($fppStatus['current_song'])) {
+            $nowPlaying = $fppStatus['current_song'];
+        } elseif (!empty($fppStatus['media_filename'])) {
+            $nowPlaying = $fppStatus['media_filename'];
+        }
+        if ($slot === 1 && $nowPlaying !== '') {
             $slotInfo['status'] = 'playing';
-            $slotInfo['mediaFilename'] = $fppStatus['media_filename'];
+            $slotInfo['mediaFilename'] = $nowPlaying;
             if (isset($fppStatus['seconds_elapsed']))
                 $slotInfo['secondsElapsed'] = intval($fppStatus['seconds_elapsed']);
             if (isset($fppStatus['seconds_remaining']))
@@ -2539,11 +3335,11 @@ function SaveRoutingMatrix()
 // POST /api/pipewire/audio/routing/volume
 // Real-time per-path volume adjustment
 // Body: { "inputGroupId": 1, "outputGroupId": 2, "volume": 75 }
-function SetRoutingPathVolume()
+function SetRoutingPathVolume($bodyOverride = null)
 {
     global $SUDO, $settings;
 
-    $body = json_decode(file_get_contents('php://input'), true);
+    $body = pw_volume_body($bodyOverride);
     if (!$body || !isset($body['inputGroupId']) || !isset($body['outputGroupId']) || !isset($body['volume'])) {
         return json(array("status" => "error", "message" => "Missing inputGroupId, outputGroupId, or volume"));
     }
@@ -2551,7 +3347,12 @@ function SetRoutingPathVolume()
     $igId = intval($body['inputGroupId']);
     $ogId = intval($body['outputGroupId']);
     $volumePct = max(0, min(100, intval($body['volume'])));
-    $volumeLinear = round($volumePct / 100.0, 3);
+    // A mute is applied as a zero on the same channelmix.volume prop -- there
+    // is no separate mute control on a combine-stream's internal output -- so
+    // the saved volume is left alone and restored on unmute.
+    $isMuteToggle = isset($body['mute']);
+    $muted = $isMuteToggle ? (bool) $body['mute'] : false;
+    $volumeLinear = round(($isMuteToggle && $muted ? 0 : $volumePct) / 100.0, 3);
 
     // Load configs to resolve node names
     $configFile = $settings['mediaDirectory'] . "/config/pipewire-input-groups.json";
@@ -2592,8 +3393,7 @@ function SetRoutingPathVolume()
 
     // The combine-stream that routes to output groups is either:
     // - fpp_input_<name> (no effects) or fpp_route_ig_<id> (with effects)
-    $routingNodeName = $hasEffects ? "fpp_route_ig_$igId"
-        : "fpp_input_" . preg_replace('/[^a-zA-Z0-9_]/', '_', strtolower($igName));
+    $routingNodeName = $hasEffects ? "fpp_route_ig_$igId" : InputGroupNodeName($igName);
 
     // Find the internal combine-stream output that targets this output group
     // The internal stream name pattern: <combine_name>.<target_name>
@@ -2608,25 +3408,15 @@ function SetRoutingPathVolume()
         return json(array("status" => "error", "message" => "Invalid PipeWire dump"));
     }
 
-    // Find nodes that belong to the routing combine-stream and target this output group
+    // Find the internal stream the routing combine-stream created towards this
+    // output group and move its level.  The match used to require the name to
+    // be "<combine>.<target>", which module-combine-stream never produces --
+    // it names them "output.<combine>_<target>" -- so nothing was ever found
+    // and every routing fader reported success while doing nothing.
     $success = false;
-    foreach ($objects as $obj) {
-        if (!isset($obj['type']) || $obj['type'] !== 'PipeWire:Interface:Node')
-            continue;
-        $props = isset($obj['info']['props']) ? $obj['info']['props'] : array();
-        $nm = isset($props['node.name']) ? $props['node.name'] : '';
-        $target = isset($props['node.target']) ? $props['node.target'] : '';
-
-        // Match internal stream: node.name starts with routing node name and targets output group
-        if (
-            ($nm === $routingNodeName || strpos($nm, $routingNodeName . '.') === 0)
-            && $target === $ogNodeName
-        ) {
-            $cmd = $SUDO . " " . $env . " pw-cli set-param " . $obj['id'] . " Props '{ channelmix.volume: $volumeLinear }' 2>&1";
-            $output = shell_exec($cmd);
-            if (strpos($output, 'Error') === false) {
-                $success = true;
-            }
+    foreach (pw_find_combine_streams($objects, $routingNodeName, $ogNodeName) as $nid => $channels) {
+        if (pw_set_node_volume_linear($nid, $volumeLinear, $channels)) {
+            $success = true;
         }
     }
 
@@ -2638,16 +3428,25 @@ function SetRoutingPathVolume()
             $pathKey = strval($ogId);
             if (!isset($ig['routing'][$pathKey]))
                 $ig['routing'][$pathKey] = array();
-            $ig['routing'][$pathKey]['volume'] = $volumePct;
+            if ($isMuteToggle) {
+                $ig['routing'][$pathKey]['mute'] = $muted;
+            } else {
+                $ig['routing'][$pathKey]['volume'] = $volumePct;
+                $ig['routing'][$pathKey]['mute'] = false;
+            }
             break;
         }
     }
     unset($ig);
     file_put_contents($configFile, json_encode($igData, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES));
 
+    $what = $isMuteToggle
+        ? ($muted ? "Route muted" : "Route unmuted at {$volumePct}%")
+        : "Route volume set to {$volumePct}%";
+
     return json(array(
         "status" => $success ? "OK" : "warning",
-        "message" => $success ? "Route volume set to {$volumePct}%" : "Volume saved but real-time update may need Apply",
+        "message" => $success ? $what : "Volume saved but real-time update may need Apply",
         "volume" => $volumePct
     ));
 }
@@ -3076,26 +3875,11 @@ function LiveApplyRoutingPreset()
 
                 $volumeLinear = $mute ? 0.0 : round($volumePct / 100.0, 3);
 
-                // Find the combine-stream output member targeting this OG
-                foreach ($pwObjects as $obj) {
-                    if (
-                        !isset($obj['type']) ||
-                        $obj['type'] !== 'PipeWire:Interface:Node'
-                    )
-                        continue;
-                    $props = isset($obj['info']['props']) ? $obj['info']['props'] : array();
-                    $nm = isset($props['node.name']) ? $props['node.name'] : '';
-                    $target = isset($props['node.target']) ? $props['node.target'] : '';
-
-                    if (
-                        ($nm === $routingNodeName ||
-                            strpos($nm, $routingNodeName . '.') === 0)
-                        && $target === $ogTarget
-                    ) {
-                        $cmd = $SUDO . " " . $env
-                            . " pw-cli set-param " . $obj['id']
-                            . " Props '{ channelmix.volume: $volumeLinear }' 2>&1";
-                        shell_exec($cmd);
+                // Find the combine-stream output member targeting this OG.
+                // Shared with SetRoutingPathVolume() so a preset and a fader
+                // move the same node the same way.
+                foreach (pw_find_combine_streams($pwObjects, $routingNodeName, $ogTarget) as $nid => $channels) {
+                    if (pw_set_node_volume_linear($nid, $volumeLinear, $channels)) {
                         $volumeChanges++;
                     }
                 }
@@ -3518,6 +4302,69 @@ function GetPipeWirePluginSources()
 }
 
 /////////////////////////////////////////////////////////////////////////////
+// Helper: PipeWire channel position array for a channel count.
+// Same table the input-mixing UI uses, so a mapping synthesised here and one
+// picked by hand in the UI describe the same layout.
+function PipeWireChannelPositions($channels)
+{
+    static $positions = array(
+        1 => array("MONO"),
+        2 => array("FL", "FR"),
+        3 => array("FL", "FR", "FC"),
+        4 => array("FL", "FR", "RL", "RR"),
+        5 => array("FL", "FR", "FC", "RL", "RR"),
+        6 => array("FL", "FR", "FC", "LFE", "RL", "RR"),
+        7 => array("FL", "FR", "FC", "LFE", "RL", "RR", "RC"),
+        8 => array("FL", "FR", "FC", "LFE", "RL", "RR", "SL", "SR")
+    );
+    $channels = intval($channels);
+    return isset($positions[$channels]) ? $positions[$channels] : $positions[2];
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// Helper: Channel count of a PipeWire node, by node.name.
+// Returns 0 when the node is not in the graph -- which is normal for nodes
+// fppd publishes, because PipeWire is started before fppd.  Callers must treat
+// 0 as "unknown", not as "no channels".
+// pw-dump is cached for the life of the request: config generation asks about
+// several nodes and the graph cannot change underneath a single generation.
+function ResolvePipeWireNodeChannels($nodeName)
+{
+    global $SUDO;
+    static $channelsByNode = null;
+
+    if (empty($nodeName)) {
+        return 0;
+    }
+
+    if ($channelsByNode === null) {
+        $channelsByNode = array();
+        $env = "PIPEWIRE_RUNTIME_DIR=/run/pipewire-fpp XDG_RUNTIME_DIR=/run/pipewire-fpp";
+        $raw = shell_exec($SUDO . " " . $env . " pw-dump 2>/dev/null");
+        $objects = $raw ? json_decode($raw, true) : null;
+        if (is_array($objects)) {
+            foreach ($objects as $obj) {
+                $props = isset($obj['info']['props']) ? $obj['info']['props'] : null;
+                if (!$props || !isset($props['node.name'])) {
+                    continue;
+                }
+                $ch = 0;
+                if (isset($props['audio.channels'])) {
+                    $ch = intval($props['audio.channels']);
+                } elseif (isset($obj['info']['params']['Format'][0]['channels'])) {
+                    $ch = intval($obj['info']['params']['Format'][0]['channels']);
+                }
+                if ($ch > 0) {
+                    $channelsByNode[$props['node.name']] = $ch;
+                }
+            }
+        }
+    }
+
+    return isset($channelsByNode[$nodeName]) ? $channelsByNode[$nodeName] : 0;
+}
+
+/////////////////////////////////////////////////////////////////////////////
 // Helper: Resolve ALSA card ID to exact PipeWire capture node name
 // Queries pw-dump to find the Audio/Source node matching the given card ID.
 function ResolveAlsaCaptureNodeName($cardId)
@@ -3710,12 +4557,50 @@ function GeneratePipeWireInputGroupsConfig($inputGroups, $outputGroups)
         $numCh = min($groupChannels, count($channelLabels));
 
         // Helper: generate stream.rules block for output groups with per-path volume
-        $generateOutputRules = function ($rules) use (&$conf, $channelPositions) {
+        //
+        // Channel layout, both ends (issue #2620 is the same bug on the output
+        // group side):
+        //   - combine.audio.position names channels of THIS input group's
+        //     combine sink -- the source of the stream.  It may only contain
+        //     labels that sink actually has, i.e. the input group's layout.
+        //   - audio.position is the layout the created stream presents to the
+        //     output group's sink.
+        // Emitting the OUTPUT group's layout for both breaks every path where
+        // the two channel counts differ: a stereo mix bus feeding an 8ch group
+        // asks combine-stream for FC/LFE/RL/RR/SL/SR that the 2ch combine does
+        // not have, and the stream then carries silence on every channel --
+        // links go active, volumes read 1.0, and nothing is audible.
+        // So map the positions the two layouts share, in output order, and let
+        // the output channels with no counterpart stay silent.  Layouts are not
+        // prefixes of each other (4ch is FL FR RL RR, not the first four of
+        // 8ch), so this has to be a positional intersection, not a truncation.
+        $generateOutputRules = function ($rules) use (&$conf, $groupChannels) {
+            $inPosList = PipeWireChannelPositions($groupChannels);
             $conf .= "      stream.rules = [\n";
             foreach ($rules as $rule) {
                 $volLinear = round($rule['volume'] / 100.0, 3);
                 $outCh = isset($rule['channels']) ? intval($rule['channels']) : 2;
-                $outPos = isset($channelPositions[$outCh]) ? $channelPositions[$outCh] : "[ FL FR ]";
+                $outPosList = PipeWireChannelPositions($outCh);
+                // array_intersect keeps the first array's order, so the shared
+                // channels come out in the output group's order.
+                $common = array_values(array_intersect($outPosList, $inPosList));
+                $remixLine = '';
+                if (!empty($common)) {
+                    $posStr = "[ " . implode(" ", $common) . " ]";
+                    $combinePos = $posStr;
+                    $streamPos = $posStr;
+                } else {
+                    // No shared labels at all -- MONO on exactly one side, which
+                    // shares no position name with any multichannel layout.
+                    // Direct mapping is impossible, so hand channelmix the input
+                    // group's own layout and let it fold or spread to the
+                    // target.  dont-remix has to come off for that to happen;
+                    // create-stream props override the stream.props default.
+                    $posStr = "[ " . implode(" ", $inPosList) . " ]";
+                    $combinePos = $posStr;
+                    $streamPos = $posStr;
+                    $remixLine = "              stream.dont-remix = false\n";
+                }
                 $conf .= "        { matches = [\n";
                 $conf .= "            { media.class = \"Audio/Sink\"\n";
                 $conf .= "              node.name = \"" . $rule['name'] . "\"\n";
@@ -3724,8 +4609,9 @@ function GeneratePipeWireInputGroupsConfig($inputGroups, $outputGroups)
                 $conf .= "          actions = {\n";
                 $conf .= "            create-stream = {\n";
                 $conf .= "              node.target = \"" . $rule['name'] . "\"\n";
-                $conf .= "              combine.audio.position = $outPos\n";
-                $conf .= "              audio.position = $outPos\n";
+                $conf .= "              combine.audio.position = $combinePos\n";
+                $conf .= "              audio.position = $streamPos\n";
+                $conf .= $remixLine;
                 if ($volLinear < 0.999) {
                     $conf .= "              channelmix.volume = $volLinear\n";
                 }
@@ -3956,7 +4842,9 @@ function GeneratePipeWireInputGroupsConfig($inputGroups, $outputGroups)
                         continue;
                 }
             } elseif ($mbrType === 'pw_source') {
-                // PipeWire Audio/Source node (e.g. from video input audio extraction)
+                // PipeWire Audio/Source node -- a video input's extracted audio,
+                // or a node published by a plugin through fppd's
+                // AudioSourceRegistry (e.g. the SMPTE plugin's LTC timecode).
                 $sourceTarget = isset($mbr['nodeName']) ? $mbr['nodeName'] : '';
                 if (empty($sourceTarget))
                     continue;
@@ -3998,6 +4886,35 @@ function GeneratePipeWireInputGroupsConfig($inputGroups, $outputGroups)
             $isMuted = isset($mbr['mute']) && $mbr['mute'] === true;
             $volume = $isMuted ? 0.0 : (isset($mbr['volume']) ? floatval($mbr['volume']) / 100.0 : 1.0);
 
+            // Channel layout for the two ends of the loopback.
+            //
+            // An explicit mapping picked in the UI wins.  Failing that, when we
+            // know the source's channel count and it differs from the group's,
+            // pin each end to its own layout.  Without this the two streams are
+            // whatever module-loopback defaults to (stereo [FL FR]) while the
+            // capture side carries stream.dont-remix, which disables up/downmix
+            // -- so a mono source lines up with neither FL nor FR and the member
+            // passes silence instead of audio.  That is what made the SMPTE
+            // plugin's mono LTC node inaudible in a stereo mix bus (issue #2754).
+            $srcChannels = isset($mbr['channels']) ? intval($mbr['channels']) : 0;
+            if ($srcChannels <= 0) {
+                $srcChannels = ResolvePipeWireNodeChannels($sourceTarget);
+            }
+            $capturePos = null;
+            $playbackPos = null;
+            $map = isset($mbr['channelMapping']) ? $mbr['channelMapping'] : null;
+            // The config file is user-editable JSON, so validate rather than
+            // letting a malformed mapping throw out of the apply.
+            if (is_array($map) &&
+                isset($map['sourceChannels']) && is_array($map['sourceChannels']) && count($map['sourceChannels']) &&
+                isset($map['groupChannels']) && is_array($map['groupChannels']) && count($map['groupChannels'])) {
+                $capturePos = $map['sourceChannels'];
+                $playbackPos = $map['groupChannels'];
+            } elseif ($srcChannels > 0 && $srcChannels !== $groupChannels) {
+                $capturePos = PipeWireChannelPositions($srcChannels);
+                $playbackPos = PipeWireChannelPositions($groupChannels);
+            }
+
             $conf .= "  # Loopback: $loopbackDesc\n";
             $conf .= "  { name = libpipewire-module-loopback\n";
             $conf .= "    args = {\n";
@@ -4009,10 +4926,9 @@ function GeneratePipeWireInputGroupsConfig($inputGroups, $outputGroups)
             $conf .= "        stream.dont-remix = true\n";
             $conf .= "        resample.disable = false\n";
 
-            // Channel mapping if specified
-            if (isset($mbr['channelMapping']) && !empty($mbr['channelMapping'])) {
-                $srcCh = $mbr['channelMapping']['sourceChannels'];
-                $conf .= "        audio.position = [ " . implode(" ", $srcCh) . " ]\n";
+            if ($capturePos !== null) {
+                $conf .= "        audio.channels = " . count($capturePos) . "\n";
+                $conf .= "        audio.position = [ " . implode(" ", $capturePos) . " ]\n";
             }
 
             $conf .= "      }\n";
@@ -4026,10 +4942,15 @@ function GeneratePipeWireInputGroupsConfig($inputGroups, $outputGroups)
                 $conf .= "        channelmix.volume = " . round($volume, 3) . "\n";
             }
 
-            // Channel mapping for the output side
-            if (isset($mbr['channelMapping']) && !empty($mbr['channelMapping'])) {
-                $grpCh = $mbr['channelMapping']['groupChannels'];
-                $conf .= "        audio.position = [ " . implode(" ", $grpCh) . " ]\n";
+            if ($playbackPos !== null) {
+                $conf .= "        audio.channels = " . count($playbackPos) . "\n";
+                $conf .= "        audio.position = [ " . implode(" ", $playbackPos) . " ]\n";
+                // Widening the capture end's layout (mono LTC into a stereo bus)
+                // needs an explicit upmix.  dont-remix is deliberately absent on
+                // this end so the mix can happen at all.
+                if (count($playbackPos) > count($capturePos)) {
+                    $conf .= "        channelmix.upmix = true\n";
+                }
             }
 
             $conf .= "      }\n";
@@ -4312,6 +5233,7 @@ function GeneratePipeWireGroupsConfig($groups, $returnCardMap = false)
     $sinkCardNumMap = array(); // ALSA card number (int) => node.name
     $sinkCardIdMap = array();  // ALSA card ID (string) => node.name
     $sinkCardRateMap = array(); // ALSA card ID (string) => negotiated audio.rate (int)
+    $sinkNodeCardIdMap = array(); // node.name => ALSA card ID (string) it plays out of
     $env = "PIPEWIRE_RUNTIME_DIR=/run/pipewire-fpp XDG_RUNTIME_DIR=/run/pipewire-fpp";
     $pwDumpJson = '';
     exec($SUDO . " " . $env . " pw-dump 2>/dev/null", $pwDumpLines);
@@ -4366,6 +5288,10 @@ function GeneratePipeWireGroupsConfig($groups, $returnCardMap = false)
                             if ($isFppNode || !isset($sinkCardIdMap[$cardIdFromProc])) {
                                 $sinkCardIdMap[$cardIdFromProc] = $nodeName;
                             }
+                            // Reverse direction: unlike cardId => node, which
+                            // has to pick a winner per card, a node plays out
+                            // of exactly one card, so this never contends.
+                            $sinkNodeCardIdMap[$nodeName] = $cardIdFromProc;
                             // Capture the rate WirePlumber negotiated for this device.
                             $nodeRate = isset($props['audio.rate']) ? intval($props['audio.rate']) : 0;
                             if ($nodeRate > 0 && !isset($sinkCardRateMap[$cardIdFromProc])) {
@@ -4381,7 +5307,8 @@ function GeneratePipeWireGroupsConfig($groups, $returnCardMap = false)
 
     // Resolve card IDs to PipeWire node names.
     // Priority order:
-    //   1. Previously-stored nodeTarget in member JSON (survives PipeWire being down)
+    //   0. Existing FPP adapter named for this card's stable ALSA ID
+    //   1. Previously-stored nodeTarget in member JSON (validated against its card)
     //   2. Direct cardId→nodeName via sinkCardIdMap (no card-number dependency)
     //   3. cardId→cardNum→nodeName via sinkCardNumMap (legacy fallback)
     //   4. Create FPP ALSA adapter if card exists but has no PipeWire sink
@@ -4443,6 +5370,40 @@ function GeneratePipeWireGroupsConfig($groups, $returnCardMap = false)
                     $unresolvedCards[] = $cardId . " (Opus RTP instance not found or disabled)";
                 }
                 continue;
+            }
+
+            // FPP adapter names encode the stable ALSA card ID. Prefer the
+            // matching live adapter over a cached target from another card.
+            $fppTarget = 'fpp_alsa_' . preg_replace('/[^a-zA-Z0-9_]/', '_', strtolower($cardId));
+            if (isset($existingSinks[$fppTarget])) {
+                $cardNodeMap[$cardId] = $fppTarget;
+                continue;
+            }
+            // With that adapter absent, the cached target still has to be
+            // disqualified before the fallbacks below can reach it.  A cached
+            // nodeTarget is only evidence about the card it was resolved for:
+            // point a member at a different sound card and the stale value can
+            // still name a live sink, which Priority 1 accepts and then caches
+            // as this card's hardware for every member using it (issue #2894).
+            // Two independent ways to catch that, needed because neither
+            // covers the other's case:
+            //   - the name.  fpp_alsa_* encodes the stable ALSA card ID, so a
+            //     mismatch shows up even while the node is not in the graph.
+            //   - the graph.  Any live sink resolves to the card it plays out
+            //     of, which is what settles WirePlumber-named targets, whose
+            //     names say nothing about the card.
+            // A target no live sink accounts for and no fpp_alsa_ name to read
+            // is left alone: it is the unplugged-device case Priority 4 exists
+            // to serve, and the card-derived lookups cannot answer it either.
+            if (isset($member['nodeTarget']) && !empty($member['nodeTarget'])) {
+                $cachedTarget = $member['nodeTarget'];
+                $cachedIsFppAdapter = (strpos($cachedTarget, 'fpp_alsa_') === 0);
+                $cachedTargetCardId = isset($sinkNodeCardIdMap[$cachedTarget])
+                    ? $sinkNodeCardIdMap[$cachedTarget] : '';
+                if (($cachedIsFppAdapter && $cachedTarget !== $fppTarget)
+                    || (!empty($cachedTargetCardId) && $cachedTargetCardId !== $cardId)) {
+                    unset($member['nodeTarget']);
+                }
             }
 
             // Priority 1: Previously-stored nodeTarget from last successful Apply
@@ -5225,7 +6186,8 @@ function GetAES67Instances()
             return json($data);
         }
     }
-    return json(array("instances" => array(), "ptpEnabled" => true, "ptpInterface" => ""));
+    return json(array("instances" => array(), "ptpEnabled" => true, "ptpInterface" => "",
+        "ptpDomain" => 0, "ptpRole" => "auto"));
 }
 
 // POST /api/pipewire/aes67/instances
@@ -5244,6 +6206,31 @@ function SaveAES67Instances()
     if (!isset($parsed['instances']) || !is_array($parsed['instances'])) {
         http_response_code(400);
         return json(array("status" => "ERROR", "message" => "Missing instances array"));
+    }
+
+    // Global PTP settings.  fppd clamps these too, but rejecting here means
+    // the user gets told rather than silently having the value changed.
+    if (!isset($parsed['ptpEnabled']))
+        $parsed['ptpEnabled'] = true;
+    if (!isset($parsed['ptpInterface']))
+        $parsed['ptpInterface'] = "";
+    if (!isset($parsed['ptpDomain'])) {
+        $parsed['ptpDomain'] = 0;
+    } else {
+        $domain = intval($parsed['ptpDomain']);
+        if ($domain < 0 || $domain > 127) {
+            http_response_code(400);
+            return json(array("status" => "ERROR",
+                "message" => "PTP domain must be between 0 and 127"));
+        }
+        $parsed['ptpDomain'] = $domain;
+    }
+    if (!isset($parsed['ptpRole'])) {
+        $parsed['ptpRole'] = "auto";
+    } else if (!in_array($parsed['ptpRole'], array("auto", "follower", "master"))) {
+        http_response_code(400);
+        return json(array("status" => "ERROR",
+            "message" => "PTP role must be auto, follower or master"));
     }
     // Validate each instance
     $nextId = 1;
@@ -5289,13 +6276,19 @@ function SaveAES67Instances()
 // and GeneratePipeWireGroupsConfig() drops a member whose instance is disabled
 // ("# WARNING: Could not find PipeWire sinks for: aes67_1").
 //
-// Applying the instance without rebuilding leaves those two disagreeing: fppd
-// starts the send pipeline, but no filter chain targets its node, and the
-// pipeline uses node.autoconnect=false so it cannot preroll with nothing
-// feeding it.  gst_element_set_state() then blocks and returns FAILURE, which
-// surfaces only as "AES67: audio send stream failed to start" -- with no hint
-// that the audio groups are the thing that is stale.  A user enabling a stream
-// has no way to know they must also re-apply the audio groups, so do it here.
+// Applying the instance without rebuilding leaves those two disagreeing: the
+// group config still names a node fppd no longer creates, or no longer names
+// one it does.  A user enabling or renaming a stream has no way to know they
+// must also re-apply the audio groups, so do it here.
+//
+// fppd no longer tries to start a sender nothing feeds -- it checks the
+// generated group config first and holds the stream idle instead (see
+// PipeWireGraphFeedsNode in PipeWireGraphConfig.cpp).  That is what keeps an
+// apply quick while an instance is still being set up: the pipeline blocked 30
+// seconds per unfed instance before failing with "audio send stream failed to
+// start", which a brand new instance always hit, because it cannot be added to
+// a group until it has been saved.  The rebuild below is still what starts the
+// stream for real once it has a group.
 //
 // Generation is pure, so compare first and only pay for the rebuild (which
 // restarts the PipeWire stack and fppd) when the graph actually changes.
@@ -5340,6 +6333,58 @@ function RebuildAudioGraphForSenderChange()
     return true;
 }
 
+// Run an fppd command over fppd's own HTTP API and report what happened.
+//
+// The AES67/Opus RTP applies used to POST to http://localhost/api/command with
+// a 10s timeout, which was wrong twice over.  That URL loops the request back
+// through Apache into a second PHP worker just to reach fppd, when fppd serves
+// the same commands directly on 32322 (as the rest of this file already does).
+// And 10s is not enough: applying an AES67 config tears down the GStreamer
+// pipelines and joins the SAP/PTP threads, each of which waits out a 1-2s
+// socket timeout, so a real apply regularly runs longer than that -- longer
+// still when it queues behind another apply on AES67Manager's mutex.
+// file_get_contents() returns false on timeout exactly as it does when nothing
+// is listening, so a slow but perfectly successful apply came back to the user
+// as "Failed to signal fppd - is it running?".
+//
+// ignore_errors keeps the body of a non-2xx reply, so fppd's own error text
+// (it answers 500 when a command fails) survives instead of collapsing to
+// false and being reported as an unreachable daemon.
+//
+// Returns array(bool ok, string message).
+function SignalFPPDCommand($command, $timeoutSeconds = 120)
+{
+    $url = 'http://localhost:32322/command/' . rawurlencode($command);
+    $ctx = stream_context_create(array(
+        'http' => array(
+            'method' => 'GET',
+            'timeout' => $timeoutSeconds,
+            'ignore_errors' => true
+        )
+    ));
+
+    $body = @file_get_contents($url, false, $ctx);
+    if ($body === false) {
+        return array(false, "Could not reach fppd on port 32322, or '" . $command .
+            "' did not finish within " . $timeoutSeconds . "s");
+    }
+
+    // file_get_contents() populates $http_response_header in this scope.
+    $code = 0;
+    if (isset($http_response_header) && is_array($http_response_header)) {
+        foreach ($http_response_header as $hdr) {
+            if (preg_match('#^HTTP/\S+\s+(\d+)#', $hdr, $m)) {
+                $code = (int) $m[1];
+            }
+        }
+    }
+    if ($code >= 400) {
+        return array(false, "fppd could not run '" . $command . "' (HTTP " . $code . "): " . trim($body));
+    }
+
+    return array(true, trim($body));
+}
+
 function ApplyAES67Instances()
 {
     global $settings;
@@ -5350,14 +6395,7 @@ function ApplyAES67Instances()
 
     if (!file_exists($configFile)) {
         // Signal cleanup
-        $result = @file_get_contents('http://localhost/api/command', false, stream_context_create(array(
-            'http' => array(
-                'method' => 'POST',
-                'header' => 'Content-Type: application/json',
-                'content' => json_encode(array('command' => 'AES67 Cleanup')),
-                'timeout' => 5
-            )
-        )));
+        SignalFPPDCommand('AES67 Cleanup');
         return json(array("status" => "OK", "message" => "No AES67 instances configured"));
     }
 
@@ -5367,25 +6405,17 @@ function ApplyAES67Instances()
     if (RebuildAudioGraphForSenderChange()) {
         return json(array(
             "status" => "OK",
-            "message" => "AES67 configuration applied; audio graph rebuilt and FPPD restarted"
+            "message" => "AES67 configuration applied; audio graph rebuilt and FPPD restarted",
+            // Same flag the audio/input group applies return, so callers can tell
+            // the slow path (stack restarted underneath them) from the cheap one.
+            "restartRequired" => true
         ));
     }
 
     // Signal fppd to apply config
-    $result = @file_get_contents('http://localhost/api/command', false, stream_context_create(array(
-        'http' => array(
-            'method' => 'POST',
-            'header' => 'Content-Type: application/json',
-            'content' => json_encode(array('command' => 'AES67 Apply')),
-            'timeout' => 10
-        )
-    )));
-
-    if ($result === false) {
-        return json(array(
-            "status" => "ERROR",
-            "message" => "Failed to signal fppd — is it running?"
-        ));
+    list($ok, $msg) = SignalFPPDCommand('AES67 Apply');
+    if (!$ok) {
+        return json(array("status" => "ERROR", "message" => $msg));
     }
 
     return json(array(
@@ -5407,26 +6437,149 @@ function GetAES67Status()
         }
     }
 
-    // Fallback: fppd not running or endpoint not available
+    // Fallback: fppd not running or endpoint not available.
+    // Shape must match AES67Manager::render_GET() so the page does not have to
+    // handle two different layouts -- it previously returned a flat ptpSynced
+    // while fppd returns a nested ptp{} object.
     return json(array(
         "pipelines" => array(),
-        "ptpSynced" => false,
-        "ptpOffsetNs" => 0,
-        "discoveredStreams" => array()
+        "ptp" => array(
+            "synced" => false,
+            "offsetNs" => 0,
+            "grandmasterId" => "",
+            "grandmasterAddress" => "",
+            "grandmasterViaBoundary" => false,
+            "portState" => "fppd not responding",
+            "isGrandmaster" => false,
+            "enabled" => false,
+            "domain" => 0,
+            "role" => "auto"
+        ),
+        "discoveredStreams" => array(),
+        "active" => false
     ));
 }
 
+// Ask fppd for the SDP of every send instance.  Generated there rather than
+// here on purpose: the same BuildSDP() that feeds the SAP announcer also feeds
+// this, so an exported file cannot drift from what is actually being
+// announced, and it carries the live PTP grandmaster in ts-refclk -- neither
+// of which this layer can know.  Returns null when fppd is not reachable.
+function AES67FetchSDP()
+{
+    $result = @file_get_contents('http://localhost:32322/aes67/sdp');
+    if ($result === false) {
+        return null;
+    }
+    $data = json_decode($result, true);
+    if ($data === null || !isset($data['streams'])) {
+        return null;
+    }
+    return $data['streams'];
+}
+
+/**
+ * Get the SDP session descriptions for the configured AES67 send streams
+ *
+ * Returns one entry per send instance, each carrying the RFC 4566 session
+ * description fppd is announcing for it.  Intended for handing a stream to a
+ * tool that cannot see FPP's SAP announcements -- Stream Monitor
+ * (https://aes67.app), VLC, or an analyser on another VLAN.
+ *
+ * @route GET /api/pipewire/aes67/sdp
+ * @response 200 Session descriptions for every send instance
+ * ```json
+ * {"status":"OK","streams":[{"instanceId":1,"name":"AES67 Stream 1","sessionName":"AES67 Stream 1","enabled":true,"sapEnabled":true,"multicastIP":"239.69.0.1","port":5004,"channels":2,"ptime":4,"filename":"aes67_stream_1.sdp","sdp":"v=0\r\n..."}]}
+ * ```
+ * @response 503 fppd is not running, so there is no applied configuration to describe
+ */
+function GetAES67SDP()
+{
+    $streams = AES67FetchSDP();
+    if ($streams === null) {
+        // Not an error the caller can fix by retrying: without fppd there is
+        // no applied config and no PTP grandmaster, so any SDP built here
+        // would describe a stream that is not on the wire.
+        http_response_code(503);
+        return json(array(
+            "status" => "ERROR",
+            "message" => "fppd is not responding — start fppd and apply the AES67 configuration first.",
+            "streams" => array()
+        ));
+    }
+    return json(array("status" => "OK", "streams" => $streams));
+}
+
+/**
+ * Download one AES67 send stream as a .sdp file
+ *
+ * The same description as the endpoint above, served as application/sdp with
+ * a Content-Disposition filename so it can be saved and opened directly in
+ * VLC.  The web UI builds its download from the JSON; this exists so a stream
+ * can be pulled with curl from the machine running the monitor.
+ *
+ * @route GET /api/pipewire/aes67/sdp/{InstanceId}
+ * @response 200 The .sdp file for that instance
+ * @response 404 No send instance with that id
+ * @response 503 fppd is not running
+ */
+function GetAES67SDPFile()
+{
+    $id = intval(params('InstanceId'));
+    $streams = AES67FetchSDP();
+    if ($streams === null) {
+        http_response_code(503);
+        return json(array("status" => "ERROR", "message" => "fppd is not responding"));
+    }
+    foreach ($streams as $s) {
+        if (isset($s['instanceId']) && intval($s['instanceId']) === $id) {
+            $name = isset($s['filename']) ? basename($s['filename']) : ('aes67_' . $id . '.sdp');
+            header("Content-Type: application/sdp");
+            header("Content-Disposition: attachment; filename=\"" . $name . "\"");
+            // application/sdp has no ExpiresByType rule, so Apache's
+            // ExpiresDefault ("access plus 1 year") would apply here and a
+            // browser would keep serving this description long after the
+            // multicast address or channel count changed.  Setting Expires
+            // ourselves also stops mod_expires from overwriting it.
+            header("Cache-Control: no-store, must-revalidate");
+            header("Expires: 0");
+            ob_clean();
+            flush();
+            echo $s['sdp'];
+            return;
+        }
+    }
+    http_response_code(404);
+    return json(array("status" => "ERROR", "message" => "No send instance with id " . $id));
+}
+
 // GET /api/pipewire/aes67/interfaces
+//
+// Wired interfaces only.  AES67 needs both PTP (which wants deterministic
+// latency and, ideally, hardware timestamping) and steady multicast; Wi-Fi
+// gives neither, so a wireless interface offered here would only ever be a
+// configuration that fails to sync.  The loopback and the AP-mode/tether
+// interfaces FPP itself brings up are dropped for the same reason.
 function GetAES67NetworkInterfaces()
 {
     $interfaces = array();
-    exec("ip -o link show | awk -F': ' '{print \$2}' | grep -v lo", $output);
-    if (!empty($output)) {
-        foreach ($output as $iface) {
-            $iface = trim($iface);
-            if (!empty($iface))
-                $interfaces[] = $iface;
-        }
+    exec("ip -o link show | awk -F': ' '{print \$2}'", $output);
+    foreach ($output as $iface) {
+        $iface = trim($iface);
+        // veth-style names come back as "eth0@if12"
+        $at = strpos($iface, '@');
+        if ($at !== false)
+            $iface = substr($iface, 0, $at);
+        if ($iface == '' || $iface == 'lo')
+            continue;
+        if (preg_match('/^(SoftAp|tether|can)/', $iface))
+            continue;
+        // sysfs is the reliable wireless test: cfg80211 drivers expose
+        // phy80211, older wext drivers expose wireless/
+        if (is_dir("/sys/class/net/" . $iface . "/wireless") ||
+            file_exists("/sys/class/net/" . $iface . "/phy80211"))
+            continue;
+        $interfaces[] = $iface;
     }
     return json($interfaces);
 }
@@ -5516,20 +6669,16 @@ function ApplyOpusRTPInstances()
     $configFile = $settings['mediaDirectory'] . "/config/pipewire-opus-rtp-instances.json";
 
     if (!file_exists($configFile)) {
-        $result = @file_get_contents('http://localhost/api/command', false, stream_context_create(array(
-            'http' => array(
-                'method' => 'POST',
-                'header' => 'Content-Type: application/json',
-                'content' => json_encode(array('command' => 'Opus RTP Cleanup')),
-                'timeout' => 5
-            )
-        )));
+        SignalFPPDCommand('Opus RTP Cleanup');
         return json(array("status" => "OK", "message" => "No Opus RTP instances configured"));
     }
 
     // Same coupling as AES67: an Opus RTP instance being enabled, disabled or
     // renamed changes the opusrtp_*_send node a group member targets, and the
-    // send pipeline cannot start until a filter chain feeds it.
+    // send pipeline cannot start until a filter chain feeds it.  fppd holds a
+    // sender nothing feeds rather than blocking on it -- see the note above
+    // RebuildAudioGraphForSenderChange() -- so this is what starts the stream
+    // once it has a group.
     if (RebuildAudioGraphForSenderChange()) {
         return json(array(
             "status" => "OK",
@@ -5537,20 +6686,9 @@ function ApplyOpusRTPInstances()
         ));
     }
 
-    $result = @file_get_contents('http://localhost/api/command', false, stream_context_create(array(
-        'http' => array(
-            'method' => 'POST',
-            'header' => 'Content-Type: application/json',
-            'content' => json_encode(array('command' => 'Opus RTP Apply')),
-            'timeout' => 10
-        )
-    )));
-
-    if ($result === false) {
-        return json(array(
-            "status" => "ERROR",
-            "message" => "Failed to signal fppd — is it running?"
-        ));
+    list($ok, $msg) = SignalFPPDCommand('Opus RTP Apply');
+    if (!$ok) {
+        return json(array("status" => "ERROR", "message" => $msg));
     }
 
     return json(array(
@@ -7009,6 +8147,23 @@ function ApplyPipeWireVideoInputSources()
                 break;
             case 'v4l2src':
                 $entry['device'] = isset($src['device']) ? $src['device'] : '/dev/video0';
+
+                // Device controls.  Every one of these defaults to "leave
+                // the camera's own setting alone" so a source configured
+                // before they existed keeps behaving identically.
+                $plf = isset($src['powerLineFrequency']) ? intval($src['powerLineFrequency']) : -1;
+                $entry['powerLineFrequency'] = ($plf >= 0 && $plf <= 2) ? $plf : -1;
+
+                $em = isset($src['exposureMode']) ? $src['exposureMode'] : 'camera';
+                $entry['exposureMode'] = in_array($em, array('auto', 'manual')) ? $em : 'camera';
+
+                // 100us units, so 1..10000 is 0.1ms..1s.  The camera's own
+                // range is applied on top of this by V4L2Device.
+                $et = isset($src['exposureTime100us']) ? intval($src['exposureTime100us']) : -1;
+                $entry['exposureTime100us'] = ($et >= 1 && $et <= 10000) ? $et : -1;
+
+                $df = isset($src['dynamicFramerate']) ? intval($src['dynamicFramerate']) : -1;
+                $entry['dynamicFramerate'] = ($df === 0 || $df === 1) ? $df : -1;
                 break;
             case 'rtspsrc':
                 $entry['uri'] = isset($src['uri']) ? $src['uri'] : '';
@@ -7064,7 +8219,17 @@ function ApplyPipeWireVideoInputSources()
 
 /////////////////////////////////////////////////////////////////////////////
 // GET /api/pipewire/video/input-sources/v4l2-devices
-// Returns available V4L2 video capture devices
+// Returns available V4L2 video capture devices.
+//
+// Only single-planar capture devices are returned.  That is deliberate:
+// GStreamer's v4l2src (what VideoInputManager builds its pipelines around)
+// only handles single-planar V4L2 capture, and every UVC webcam / USB
+// capture dongle sets V4L2_CAP_VIDEO_CAPTURE (0x1).  Filtering on a
+// substring match of "Video Capture" instead — as this used to — matched
+// the Pi's internal m2m nodes (rpi-hevc-dec's "Format Video Capture
+// Multiplanar:" heading, and pispbe's CAPTURE_MPLANE nodes), so the
+// dropdown was full of decoder/ISP devices that can never produce a
+// picture, with no way for the user to tell which entry was their camera.
 function GetV4L2Devices()
 {
     $devices = array();
@@ -7074,6 +8239,11 @@ function GetV4L2Devices()
     if ($videoDevs === false) {
         return json(array("devices" => array()));
     }
+
+    // V4L2 capability bits (linux/videodev2.h)
+    $V4L2_CAP_VIDEO_CAPTURE = 0x00000001;
+    $V4L2_CAP_VIDEO_OUTPUT = 0x00000002;
+    $V4L2_CAP_VIDEO_M2M = 0x00008000;
 
     foreach ($videoDevs as $devPath) {
         // Use v4l2-ctl to get device capabilities
@@ -7085,8 +8255,19 @@ function GetV4L2Devices()
 
         $info = implode("\n", $output);
 
-        // Only include capture devices (not output or m2m)
-        if (strpos($info, 'Video Capture') === false)
+        // Prefer "Device Caps" (what this node can do) over "Capabilities"
+        // (what the whole physical device can do across all its nodes).
+        if (!preg_match('/Device Caps\s*:\s*0x([0-9a-fA-F]+)/', $info, $m) &&
+            !preg_match('/Capabilities\s*:\s*0x([0-9a-fA-F]+)/', $info, $m)) {
+            continue;
+        }
+        $caps = hexdec($m[1]);
+
+        // Must be a single-planar capture node, and must not be a
+        // memory-to-memory (decoder/encoder/ISP) or output node.
+        if (!($caps & $V4L2_CAP_VIDEO_CAPTURE))
+            continue;
+        if ($caps & ($V4L2_CAP_VIDEO_OUTPUT | $V4L2_CAP_VIDEO_M2M))
             continue;
 
         // Extract device name
@@ -7095,13 +8276,294 @@ function GetV4L2Devices()
             $name = trim($m[1]);
         }
 
+        // Bus info distinguishes two identical cameras from each other.
+        $bus = '';
+        if (preg_match('/Bus info\s*:\s*(.+)/', $info, $m)) {
+            $bus = trim($m[1]);
+        }
+
+        // The camera's *current* anti-flicker setting, parsed out of the
+        // --all output we already have.  Surfacing it matters: a camera
+        // whose power_line_frequency is set for the wrong region bands or
+        // pulses under mains lighting, and the symptom (flicker) gives no
+        // hint that a device control is responsible.  0 = disabled,
+        // 1 = 50Hz, 2 = 60Hz, null = camera has no such control.
+        $powerLine = null;
+        if (preg_match('/power_line_frequency\s+0x[0-9a-fA-F]+\s*\(menu\)\s*:.*?value=(\d+)/', $info, $m)) {
+            $powerLine = intval($m[1]);
+        }
+
         $devices[] = array(
             'device' => $devPath,
             'name' => $name,
+            'busInfo' => $bus,
+            'powerLineFrequency' => $powerLine,
+            'hasExposureControls' => (strpos($info, 'auto_exposure') !== false),
+            'modes' => GetV4L2DeviceModes($devPath),
         );
     }
 
     return json(array("devices" => $devices));
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// Return the discrete capture modes a V4L2 device actually supports, as
+// [ {format, width, height, framerates[]}, ... ].
+//
+// The UI uses this to offer real resolutions instead of free-text boxes:
+// a webcam only negotiates its native sizes, so an arbitrary value like
+// 240x135 @ 10fps fails to start with nothing but "failed to start" in
+// the log.
+function GetV4L2DeviceModes($devPath)
+{
+    $modes = array();
+    $output = array();
+    $ret = 0;
+    exec("v4l2-ctl -d " . escapeshellarg($devPath) . " --list-formats-ext 2>/dev/null", $output, $ret);
+    if ($ret !== 0)
+        return $modes;
+
+    $curFormat = '';
+    $curSize = null;
+    foreach ($output as $line) {
+        if (preg_match("/\[\d+\]:\s*'(\w+)'/", $line, $m)) {
+            $curFormat = $m[1];
+            $curSize = null;
+        } else if (preg_match('/Size:\s*Discrete\s*(\d+)x(\d+)/', $line, $m)) {
+            if ($curSize !== null)
+                $modes[] = $curSize;
+            $curSize = array(
+                'format' => $curFormat,
+                'width' => intval($m[1]),
+                'height' => intval($m[2]),
+                'framerates' => array(),
+            );
+        } else if ($curSize !== null &&
+                   preg_match('/Interval:\s*Discrete\s*[\d.]+s\s*\(([\d.]+)\s*fps\)/', $line, $m)) {
+            $fps = intval(round(floatval($m[1])));
+            if ($fps > 0 && !in_array($fps, $curSize['framerates']))
+                $curSize['framerates'][] = $fps;
+        }
+    }
+    if ($curSize !== null)
+        $modes[] = $curSize;
+
+    return $modes;
+}
+
+/////////////////////////////////////////////////////////////////////////////
+// GET /api/pipewire/video/input-sources/:id/preview
+// Returns a JPEG snapshot of a video input source, for the config page's
+// live preview.  Two paths, because a capture device can only be opened once:
+//   - source running in fppd -> ask fppd, which taps its intervideo channel
+//   - source stopped/disabled -> grab straight off the device ourselves, so
+//     the operator can confirm they picked the right camera before enabling it
+// Ask fppd for a frame from a running source.  Returns the JPEG bytes, or
+// false when the source isn't running (or fppd isn't answering).
+function FetchFppdVideoPreview($id, $width)
+{
+    $ctx = stream_context_create(array('http' => array('timeout' => 4)));
+    $jpeg = @file_get_contents('http://localhost:32322/videoinput/preview?id=' . intval($id) .
+                               '&width=' . intval($width), false, $ctx);
+    if ($jpeg !== false && strlen($jpeg) > 2 && substr($jpeg, 0, 2) === "\xFF\xD8")
+        return $jpeg;
+    return false;
+}
+
+function GetVideoInputPreview()
+{
+    global $settings;
+
+    $id = intval(params('id'));
+    $width = isset($_GET['width']) ? intval($_GET['width']) : 320;
+    if ($width < 32)
+        $width = 32;
+    if ($width > 1280)
+        $width = 1280;
+
+    // Read the source config up front rather than only on the fallback path.
+    // A test pattern the operator has just picked but not saved yet has to be
+    // recognised *before* fppd is asked for a frame, because fppd would answer
+    // with the pattern it is actually running -- i.e. the previously saved one
+    // -- and the preview would sit there unchanged no matter what was selected.
+    $sourcesFile = $settings['mediaDirectory'] . "/config/pipewire-video-input-sources.json";
+    $device = '';
+    $srcType = '';
+    $pattern = 'smpte';
+    $srcWidth = 320;
+    $srcHeight = 240;
+    if (file_exists($sourcesFile)) {
+        $data = json_decode(file_get_contents($sourcesFile), true);
+        if (is_array($data) && isset($data['videoInputSources'])) {
+            foreach ($data['videoInputSources'] as $src) {
+                if (intval($src['id']) === $id) {
+                    $srcType = isset($src['type']) ? $src['type'] : '';
+                    $device = isset($src['device']) ? $src['device'] : '';
+                    $pattern = isset($src['pattern']) ? $src['pattern'] : 'smpte';
+                    $srcHeight = isset($src['height']) ? intval($src['height']) : 240;
+                    $srcWidth = isset($src['width']) ? intval($src['width']) : 320;
+                    break;
+                }
+            }
+        }
+    }
+
+    // A test pattern is synthetic: no device to contend for, no second
+    // network session to open, nothing to warm up.  It is the one source
+    // type that can always be rendered on demand, so a disabled one should
+    // still preview rather than telling the operator to enable and save
+    // first just to see what "pinwheel" looks like.
+    //
+    // The page sends the pattern and size it currently has selected, which
+    // may not be what is on disk yet.  Honouring that is the whole point of
+    // a preview button: it answers "what will this look like" before the
+    // operator commits, so an unsaved selection has to win over both the
+    // saved config and whatever fppd happens to be running.
+    $validPatterns = array('smpte', 'snow', 'black', 'white', 'red', 'green', 'blue',
+                           'checkers-1', 'checkers-4', 'circular', 'smpte75',
+                           'ball', 'bar', 'pinwheel', 'gradient');
+
+    if ($srcType === 'videotestsrc') {
+        $livePattern = $pattern;
+
+        // Whitelisted rather than escaped: this is a GStreamer enum with a
+        // known set of values, and the list is the same one the UI offers.
+        // An unrecognised request falls back to the saved pattern instead of
+        // silently rendering something the operator did not ask for.
+        if (isset($_GET['pattern']) && in_array($_GET['pattern'], $validPatterns, true))
+            $pattern = $_GET['pattern'];
+        if (!in_array($pattern, $validPatterns, true))
+            $pattern = 'smpte';
+
+        // Unsaved dimensions matter too -- they set the preview's aspect.
+        if (isset($_GET['srcw']) && intval($_GET['srcw']) > 0)
+            $srcWidth = min(7680, intval($_GET['srcw']));
+        if (isset($_GET['srch']) && intval($_GET['srch']) > 0)
+            $srcHeight = min(4320, intval($_GET['srch']));
+
+        // When the selection matches what is already running, prefer fppd's
+        // live frame: it comes from one continuous pipeline, so the animated
+        // patterns move exactly as they will in the real output.
+        if ($pattern === $livePattern) {
+            $jpeg = FetchFppdVideoPreview($id, $width);
+            if ($jpeg !== false) {
+                header('Content-Type: image/jpeg');
+                header('Cache-Control: no-store');
+                echo $jpeg;
+                exit(0);
+            }
+        }
+
+        // Preserve the source's own aspect ratio at the requested preview
+        // width, matching what the running-source path produces.
+        $h = ($srcWidth > 0) ? intval(round($width * $srcHeight / $srcWidth)) : $width;
+        if ($h < 1)
+            $h = 1;
+
+        // Each request here is its own gst-launch, starting from frame zero,
+        // so without help every poll returns a byte-identical image and even
+        // a moving pattern looks frozen.
+        //
+        // Only three of videotestsrc's fifteen patterns actually move: ball,
+        // snow, and smpte (which carries a noise block in one corner).  The
+        // other twelve are static images by design -- there is nothing to
+        // advance, and no reason to pay for extra frames.
+        // All three animate off an internal frame counter that restarts with
+        // every process, so vary how far into the stream we grab: multifilesink
+        // overwrites, leaving the last buffer.  Tying the offset to a 10Hz
+        // clock means consecutive polls advance one frame each, which is
+        // exactly what the live path does at 10fps -- so the motion matches.
+        //
+        // videotestsrc does expose animation-mode=wall-time, but it only
+        // drives 'ball' and runs it far faster than a 10fps poll can sample:
+        // the ball teleported around the frame instead of tracking across it.
+        //
+        // The counter wraps every 24 frames (~2.4s), which costs one visible
+        // jump per cycle.  Extending it is pure cost -- roughly 1.5ms per
+        // extra frame, every request -- and this is a preview of a source
+        // that is not running; enable it and the live path takes over with
+        // genuinely continuous motion.
+        $numBuffers = 2;
+        if ($pattern === 'ball' || $pattern === 'snow' || $pattern === 'smpte')
+            $numBuffers = 2 + (intval(floor(microtime(true) * 10)) % 24);
+
+        $tmp = tempnam('/tmp', 'fppvidprev') . '.jpg';
+        $cmd = 'timeout 5 gst-launch-1.0 -q'
+             . ' videotestsrc num-buffers=' . $numBuffers
+             . ' pattern=' . escapeshellarg($pattern)
+             . ' ! video/x-raw,width=' . $width . ',height=' . $h . ',pixel-aspect-ratio=1/1'
+             . ' ! videoconvert'
+             . ' ! jpegenc quality=70'
+             . ' ! multifilesink location=' . escapeshellarg($tmp) . ' 2>/dev/null';
+        exec($cmd, $out, $ret);
+
+        if (file_exists($tmp) && filesize($tmp) > 0) {
+            header('Content-Type: image/jpeg');
+            header('Cache-Control: no-store');
+            readfile($tmp);
+            unlink($tmp);
+            exit(0);
+        }
+        if (file_exists($tmp))
+            unlink($tmp);
+
+        header('HTTP/1.1 503 Service Unavailable');
+        header('Content-Type: application/json');
+        echo json_encode(array('status' => 'error',
+                               'message' => 'Could not render the "' . $pattern . '" test pattern.'));
+        exit(0);
+    }
+
+    // Every other type: fppd's running pipeline is the only source of a
+    // frame that reflects reality, so ask it first.
+    $jpeg = FetchFppdVideoPreview($id, $width);
+    if ($jpeg !== false) {
+        header('Content-Type: image/jpeg');
+        header('Cache-Control: no-store');
+        echo $jpeg;
+        exit(0);
+    }
+
+    // Not running.  Network sources would mean opening a second RTSP/HTTP
+    // session, which is not what a preview button should quietly do, so only
+    // a local capture device is grabbable from here.
+    if ($srcType !== 'v4l2src' || $device === '' || !preg_match('#^/dev/video\d+$#', $device)) {
+        header('HTTP/1.1 503 Service Unavailable');
+        header('Content-Type: application/json');
+        echo json_encode(array('status' => 'error',
+                               'message' => 'No preview available. Enable and save the source, then retry.'));
+        exit(0);
+    }
+
+    $tmp = tempnam('/tmp', 'fppvidprev') . '.jpg';
+    // decodebin + videoscale for the same reason the capture pipeline needs
+    // them: cameras hand back MJPEG or a native size we didn't ask for.
+    // num-buffers=8 discards the first few frames, which are often black or
+    // mid-auto-exposure on a freshly opened webcam.
+    $cmd = 'timeout 8 gst-launch-1.0 -q'
+         . ' v4l2src device=' . escapeshellarg($device) . ' num-buffers=8'
+         . ' ! decodebin ! videoconvert ! videoscale'
+         . ' ! video/x-raw,width=' . $width . ',pixel-aspect-ratio=1/1'
+         . ' ! jpegenc quality=70'
+         . ' ! multifilesink location=' . escapeshellarg($tmp) . ' 2>/dev/null';
+    exec($cmd, $out, $ret);
+
+    if (file_exists($tmp) && filesize($tmp) > 0) {
+        header('Content-Type: image/jpeg');
+        header('Cache-Control: no-store');
+        readfile($tmp);
+        unlink($tmp);
+        exit(0);
+    }
+    if (file_exists($tmp))
+        unlink($tmp);
+
+    header('HTTP/1.1 503 Service Unavailable');
+    header('Content-Type: application/json');
+    echo json_encode(array('status' => 'error',
+                           'message' => 'Could not read a frame from ' . $device .
+                                        '. Check the device is connected and not in use.'));
+    exit(0);
 }
 
 /////////////////////////////////////////////////////////////////////////////

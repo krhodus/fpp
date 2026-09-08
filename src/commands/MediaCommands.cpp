@@ -15,6 +15,7 @@
 #include "fpp-json.h"
 
 #include "../Warnings.h" // WarningHolder -- needed directly for NOPCH builds
+#include "../common.h"   // SaveJsonToString -- needed directly for NOPCH builds
 
 #include <curl/curl.h>
 
@@ -30,35 +31,6 @@
 #include "MediaCommands.h"
 #include "../mediaoutput/GStreamerOut.h"
 #include "../mediaoutput/StreamSlotManager.h"
-
-SetVolumeCommand::SetVolumeCommand() :
-    Command("Volume Set", "Sets the volume to the specific value. (0 - 100)") {
-    args.push_back(CommandArg("volume", "int", "Volume").setRange(0, 100).setDefaultValue("70").setGetAdjustableValueURL("api/fppd/volume?simple=true"));
-}
-std::unique_ptr<Command::Result> SetVolumeCommand::run(const std::vector<std::string>& args) {
-    if (args.size() != 1) {
-        return std::make_unique<Command::ErrorResult>("Not found");
-    }
-
-    int v = std::atoi(args[0].c_str());
-    setVolume(v);
-    return std::make_unique<Command::Result>("Volume Set");
-}
-
-AdjustVolumeCommand::AdjustVolumeCommand() :
-    Command("Volume Adjust", "Adjust volume either up or down by the given amount. (-100 - 100)") {
-    args.push_back(CommandArg("volume", "int", "Volume").setRange(-100, 100).setDefaultValue("0"));
-}
-std::unique_ptr<Command::Result> AdjustVolumeCommand::run(const std::vector<std::string>& args) {
-    if (args.size() != 1) {
-        return std::make_unique<Command::ErrorResult>("Not found");
-    }
-
-    int v = getVolume();
-    v += std::atoi(args[0].c_str());
-    setVolume(v);
-    return std::make_unique<Command::Result>("Volume Set");
-}
 
 IncreaseVolumeCommand::IncreaseVolumeCommand() :
     Command("Volume Increase", "Increases the volume by the given amount (0 - 100)") {
@@ -247,6 +219,78 @@ std::unique_ptr<Command::Result> URLCommand::run(const std::vector<std::string>&
     return std::make_unique<CURLResult>(args);
 }
 
+// Apply a volume to one node of the PipeWire graph rather than the global
+// master.  "target" is a flat key from GET /api/pipewire/audio/targets
+// ("sink:<node>", "slot:<n>", "input:<groupId>:<memberIndex>",
+// "route:<inputGroupId>:<outputGroupId>").  With relative set, the value is a
+// delta against the target's own current level rather than an absolute.
+//
+// Handed to the PHP API rather than resolved here: mapping a target to a
+// PipeWire node means reading the group/input-group JSON and reproducing the
+// node-naming rules, and reading a target's current level back for a relative
+// adjust -- all of which already exist in www/api/controllers/pipewire.php and
+// would otherwise have to be kept in sync in a second language.  Same loopback
+// approach ApplyRoutingPresetCommand below already uses.
+static std::unique_ptr<Command::Result> setTargetedVolume(const std::string& target, int value, bool relative) {
+    Json::Value body;
+    body["target"] = target;
+    if (relative) {
+        body["adjust"] = value;
+    } else {
+        body["volume"] = value;
+    }
+
+    std::vector<std::string> curlArgs = {
+        "http://localhost/api/system/volume",
+        "POST",
+        SaveJsonToString(body)
+    };
+    return std::make_unique<CURLResult>(curlArgs);
+}
+
+SetVolumeCommand::SetVolumeCommand() :
+    Command("Volume Set", "Sets the volume to the specific value. (0 - 100)") {
+    args.push_back(CommandArg("volume", "int", "Volume").setRange(0, 100).setDefaultValue("70").setGetAdjustableValueURL("api/fppd/volume?simple=true"));
+    // Optional and trailing: every existing caller passes only the volume and
+    // must keep hitting the global-master path below untouched.
+    args.push_back(CommandArg("target", "string", "Target", true)
+                       .setContentListUrl("api/pipewire/audio/targets", true));
+}
+std::unique_ptr<Command::Result> SetVolumeCommand::run(const std::vector<std::string>& args) {
+    if (args.empty()) {
+        return std::make_unique<Command::ErrorResult>("Not found");
+    }
+
+    int v = std::atoi(args[0].c_str());
+    if (args.size() > 1 && !args[1].empty()) {
+        return setTargetedVolume(args[1], v, false);
+    }
+    setVolume(v);
+    return std::make_unique<Command::Result>("Volume Set");
+}
+
+AdjustVolumeCommand::AdjustVolumeCommand() :
+    Command("Volume Adjust", "Adjust volume either up or down by the given amount. (-100 - 100)") {
+    args.push_back(CommandArg("volume", "int", "Volume").setRange(-100, 100).setDefaultValue("0"));
+    args.push_back(CommandArg("target", "string", "Target", true)
+                       .setContentListUrl("api/pipewire/audio/targets", true));
+}
+std::unique_ptr<Command::Result> AdjustVolumeCommand::run(const std::vector<std::string>& args) {
+    if (args.empty()) {
+        return std::make_unique<Command::ErrorResult>("Not found");
+    }
+
+    int delta = std::atoi(args[0].c_str());
+    if (args.size() > 1 && !args[1].empty()) {
+        return setTargetedVolume(args[1], delta, true);
+    }
+
+    int v = getVolume();
+    v += delta;
+    setVolume(v);
+    return std::make_unique<Command::Result>("Volume Set");
+}
+
 #ifdef HAS_GSTREAMER
 
 // Common data for tracking running command media
@@ -377,6 +421,20 @@ std::unique_ptr<Command::Result> PlayMediaCommand::run(const std::vector<std::st
     bool syncToShow = false;
     if (args.size() > 5) {
         syncToShow = (args[5] == "true" || args[5] == "1");
+    }
+
+    // A slot holds one stream at a time. Without this, a repeated "Play
+    // Media" on the same slot (e.g. pressing play twice) would build a
+    // second GStreamer pipeline that reuses the same PipeWire node name
+    // (StreamSlotManager::GetNodeName() is keyed only by slot number), while
+    // the first pipeline is left running -- StreamSlotManager only ever
+    // tracks the newest output, so the original becomes untracked and
+    // unstoppable via any command, and the two streams mix audibly. Stop
+    // whatever already holds the slot first so only one stream ever owns it.
+    GStreamerOutput* existingSlotOutput = StreamSlotManager::Instance().GetActiveOutput(slot);
+    if (existingSlotOutput) {
+        LogInfo(VB_COMMAND, "Play Media: slot %d already active, stopping previous stream before starting %s\n", slot, args[0].c_str());
+        existingSlotOutput->Stop();
     }
 
     MediaOutputBase* out = nullptr;
