@@ -582,6 +582,11 @@ def PhcIndexForInterface(iface):
         return None
 
 
+# Top of the Dante/RAVENNA link offset range.  A transmit lead beyond this
+# cannot be held by an Ultimo-class receiver's playout buffer.
+RISKY_LEAD_MS = 5.0
+
+
 def check_presentation_time(rep, pkts, rate, iface):
     """How far each packet's RTP timestamp leads its actual transmission.
 
@@ -615,9 +620,29 @@ def check_presentation_time(rep, pkts, rate, iface):
     rep.info(f"RTP timestamp leads transmission by {med:+.2f}ms "
              f"(p10 {_pct(leads, 10):+.2f}, p90 {_pct(leads, 90):+.2f})")
 
-    if med > 0.5:
+    # Both directions fail, and this check used to see only one of them: it
+    # passed anything above +0.5ms, so the 20ms lead that silenced Ultimo-class
+    # receivers on #2848 reported OK here while the receiver reported every
+    # packet late or missing.  A lead the receiver cannot buffer is as fatal as
+    # no lead at all -- the packet arrives before there is anywhere to put it.
+    #
+    # The ceiling is the smallest link offset on the network, which this cannot
+    # know, so RISKY_LEAD_MS is the top of the Dante/RAVENNA range (0.25-5ms)
+    # and anything past it is a warning rather than a failure.  Keep in step
+    # with AES67::RISKY_TARGET_LEAD_MS in src/mediaoutput/AES67Manager.h.
+    if med > RISKY_LEAD_MS:
+        rep.warn(f"packets are sent {med:.1f}ms before their playout time, more "
+                 f"than the 0.25-{RISKY_LEAD_MS:g}ms a Dante/RAVENNA receiver "
+                 f"buffers")
+        rep.info("the lead is held in the RECEIVER's playout buffer, so its "
+                 "link offset must be at least this large or it discards the "
+                 "packets and reports them as late or missing")
+        rep.info('check "targetLeadMs" in '
+                 "config/pipewire-aes67-instances.json - absent means fppd's "
+                 "own default")
+    elif med > 0.5:
         rep.ok(f"packets are sent {med:.1f}ms before their playout time")
-        rep.info("a receiver needs its link offset to be less than this")
+        rep.info("a receiver needs its link offset to be at least this large")
     elif med > -0.5:
         rep.warn(f"packets are sent at essentially their playout time "
                  f"({med:+.2f}ms) - no margin for the receiver")

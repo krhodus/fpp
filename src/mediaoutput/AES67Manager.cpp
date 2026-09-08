@@ -318,6 +318,37 @@ bool AES67Manager::LoadConfig() {
         cfg.ptpRole = "auto";
     }
 
+    // The transmit lead is the one setting here that produces a stream every
+    // transport check passes and no shallow receiver can play, so it is the
+    // one that has to say out loud what it is doing.  A stored value overrides
+    // the default silently and forever -- see the note on targetLeadMs.
+    if (cfg.targetLeadMs < AES67::MIN_TARGET_LEAD_MS ||
+        cfg.targetLeadMs > AES67::MAX_TARGET_LEAD_MS) {
+        LogWarn(VB_MEDIAOUT,
+                "AES67Manager: transmit lead %dms is outside %d-%dms and cannot "
+                "work on any network, using %d\n",
+                cfg.targetLeadMs, AES67::MIN_TARGET_LEAD_MS,
+                AES67::MAX_TARGET_LEAD_MS, kDefault.targetLeadMs);
+        cfg.targetLeadMs = kDefault.targetLeadMs;
+    } else if (cfg.targetLeadMs > AES67::RISKY_TARGET_LEAD_MS) {
+        // Honoured, not corrected: a box whose only receivers are deep-buffered
+        // may want this.  But it is the shape of the #2848 failure, so name it
+        // and name the symptom -- otherwise the next person measures a clean
+        // stream and looks everywhere but here.
+        LogWarn(VB_MEDIAOUT,
+                "AES67Manager: transmit lead is %dms, beyond the 0.25-%dms link "
+                "offset a Dante/RAVENNA receiver holds%s. Receivers that cannot "
+                "buffer that far ahead will report these packets as late or "
+                "missing even though the stream is otherwise clean. The verified "
+                "value is %dms.\n",
+                cfg.targetLeadMs, AES67::RISKY_TARGET_LEAD_MS,
+                cfg.targetLeadMs == AES67::LEGACY_TARGET_LEAD_MS
+                    ? " -- this is the pre-2026-09 default left in "
+                      "pipewire-aes67-instances.json"
+                    : "",
+                kDefault.targetLeadMs);
+    }
+
     if (root.isMember("instances") && root["instances"].isArray()) {
         for (const auto& instJson : root["instances"]) {
             AES67Instance inst;
