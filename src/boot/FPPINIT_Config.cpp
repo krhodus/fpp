@@ -991,6 +991,60 @@ static void migrateMultiSyncDefaultToMulticast() {
     }
 }
 
+// AES67Config::targetLeadMs is how far ahead of its declared playout time each
+// RTP packet is transmitted.  It defaulted to 20ms, and 20ms overruns the
+// playout buffer of any receiver whose link offset is the usual Dante/RAVENNA
+// 0.25-5ms: those receivers discard every packet and report them as late or
+// missing, on a stream whose payload, sequence, timestamps, pacing and media
+// clock all measure perfect.  The default is now 3ms (see the note on
+// targetLeadMs in src/mediaoutput/AES67Manager.h), verified against both an
+// Ultimo-class receiver and a Brooklyn II.
+//
+// Moving that default does not reach a box that has the old one on disk.
+// AES67Manager reads the key out of config/pipewire-aes67-instances.json and
+// only falls back to the compiled default when it is absent, and the AES67 page
+// round-trips the whole document on every save -- so a stored 20 outlives every
+// update.  An FPPOS reflash replaces /opt/fpp but preserves /home/fpp/media,
+// config included, which is exactly the file carrying it.
+//
+// Deleting the key rather than rewriting it to 3 leaves the box tracking
+// fppd's default, including the next time it moves.  Only an exact 20 is
+// touched: any other value was chosen deliberately, and a network of
+// deep-buffered receivers is a legitimate reason to have raised it.
+//
+// (In-place `fpp upgrade`s are handled separately, by upgrade/139/upgrade.sh
+// via the version-gated upgrade_config path.  Keep the two in step.)
+static void migrateAES67TransmitLead() {
+    static const int LEGACY_TARGET_LEAD_MS = 20;
+    static const std::string CONFIG =
+        FPP_MEDIA_DIR + "/config/pipewire-aes67-instances.json";
+
+    if (!FileExists(CONFIG)) {
+        return;
+    }
+
+    Json::Value root;
+    if (!LoadJsonFromString(GetFileContents(CONFIG), root, JsonRoot::Object)) {
+        // A config fppd itself cannot parse is not this migration's to repair.
+        printf("AES67: could not parse %s, leaving it alone\n", CONFIG.c_str());
+        return;
+    }
+
+    // get() rather than operator[], which would insert a null member on a
+    // config that has no lead stored; isIntegral() before asInt(), because
+    // jsoncpp throws Json::LogicError on a value that is not convertible and a
+    // hand-edited config can hold anything.
+    const Json::Value lead = root.get("targetLeadMs", Json::Value());
+    if (!lead.isIntegral() || lead.asInt() != LEGACY_TARGET_LEAD_MS) {
+        return;
+    }
+
+    root.removeMember("targetLeadMs");
+    PutFileContents(CONFIG, SaveJsonToString(root));
+    printf("AES67: removed the stale %dms transmit lead from %s; the stream now "
+           "uses fppd's default\n", LEGACY_TARGET_LEAD_MS, CONFIG.c_str());
+}
+
 // Config-state migrations that must survive an FPPOS reflash, gated on the
 // same /fppos_upgraded marker as checkInstallPackages() (touched by
 // upgradeOS-part2.sh, which is always sourced from the target image being
@@ -1003,6 +1057,7 @@ static void migrateMultiSyncDefaultToMulticast() {
 void checkConfigMigrations() {
     if (FileExists("/fppos_upgraded")) {
         migrateMultiSyncDefaultToMulticast();
+        migrateAES67TransmitLead();
     }
 }
 

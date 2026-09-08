@@ -6232,6 +6232,21 @@ function SaveAES67Instances()
         return json(array("status" => "ERROR",
             "message" => "PTP role must be auto, follower or master"));
     }
+    // Transmit lead.  Not exposed in the page, so this only ever sees a value
+    // the document already carried or something hand-edited into it -- but the
+    // page round-trips the whole document, so this is the write path that keeps
+    // a stale value alive across every save.  Bounds match AES67::
+    // MIN/MAX_TARGET_LEAD_MS in src/mediaoutput/AES67Manager.h; keep them in
+    // step.  Absent stays absent so the box tracks fppd's default.
+    if (isset($parsed['targetLeadMs'])) {
+        $lead = intval($parsed['targetLeadMs']);
+        if ($lead < 1 || $lead > 50) {
+            http_response_code(400);
+            return json(array("status" => "ERROR",
+                "message" => "AES67 transmit lead must be between 1 and 50 ms"));
+        }
+        $parsed['targetLeadMs'] = $lead;
+    }
     // Validate each instance
     $nextId = 1;
     foreach ($parsed['instances'] as &$inst) {

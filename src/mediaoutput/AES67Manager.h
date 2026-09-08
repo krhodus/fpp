@@ -114,6 +114,34 @@ constexpr int MAX_SUPPORTED_CHANNELS = 8;
 constexpr int MULTICHANNEL_NEEDS_BUFFER_COPY = 2;
 constexpr int DEFAULT_LATENCY_MS    = 10;
 
+// Bounds on AES67Config::targetLeadMs -- see the long note on that member for
+// what the lead is and why both directions bite.
+//
+// These are sanity rails, not a recommendation.  The real ceiling is the
+// smallest receiver link offset on the network and nothing here can know it;
+// what these catch is a value that cannot work on ANY network, and a stale
+// stored value that used to be the default.
+//
+// MIN is 1ms because the sender's own measured worst-case transmission
+// lateness is 0.235ms at 1ms ptime and 0.64ms at 4ms; at or below zero every
+// packet that slips is discarded by a conformant receiver.  MAX is 50ms
+// because the deepest receiver buffer anyone has reported is a Brooklyn II
+// and even that absorbed 20ms only just.
+//
+// RISKY is the value above which the lead exceeds the Dante/RAVENNA link
+// offset range (0.25-5ms), i.e. the point where Ultimo-class receivers can no
+// longer hold it and report the packets as late or missing.  Configs above it
+// are honoured -- someone may genuinely have only deep-buffered receivers --
+// but they are named in the log, because the failure they cause otherwise
+// looks like a sender fault on a stream that measures perfect.
+constexpr int MIN_TARGET_LEAD_MS   = 1;
+constexpr int MAX_TARGET_LEAD_MS   = 50;
+constexpr int RISKY_TARGET_LEAD_MS = 5;
+
+// The default this shipped with before 2026-09.  Kept only so ParseConfig can
+// recognise a stored copy of it; upgrade/139 removes it from configs on disk.
+constexpr int LEGACY_TARGET_LEAD_MS = 20;
+
 // DSCP codepoints (AES67-2018 / AES-R16 QoS recommendations)
 constexpr int AUDIO_DSCP             = 34;      // AF41 -- RTP audio (udpsink qos-dscp)
 constexpr int PTP_DSCP                = 46;     // EF   -- PTP event/general messages (ptp4l dscp_event/dscp_general)
@@ -687,6 +715,15 @@ struct AES67Config {
     //
     // Global, not per-instance: one lead for every stream on the box.  Raising
     // it for a receiver with a deep buffer raises it for the shallow ones too.
+    //
+    // Changing this default does NOT reach an existing box.  The key is read
+    // out of pipewire-aes67-instances.json and the AES67 page round-trips that
+    // whole document on every save, so a stored 20 from the old default
+    // survives every update, forever, and the box keeps failing on shallow
+    // receivers with a stream whose every other metric is perfect.  That is
+    // what upgrade/139 exists to undo; ParseConfig bounds-checks and reports
+    // whatever survives.  Anything added here that a stored value can override
+    // needs the same treatment.
     int targetLeadMs = 3;
 
     // Mix a permanent silence source in with the captured audio.
